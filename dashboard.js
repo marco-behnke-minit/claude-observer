@@ -106,6 +106,55 @@ function renderCpuSection(cols) {
   return lines;
 }
 
+function unitToBytes(value, unit) {
+  const n = parseFloat(value);
+  if (Number.isNaN(n)) return NaN;
+  const mult = { G: 1024 ** 3, M: 1024 ** 2, K: 1024 }[unit.toUpperCase()];
+  return n * (mult || 1);
+}
+
+function formatBytesShort(bytes) {
+  const gb = bytes / (1024 ** 3);
+  if (gb >= 1) {
+    return `${gb % 1 === 0 ? gb.toFixed(0) : gb.toFixed(1)}G`;
+  }
+  const mb = bytes / (1024 ** 2);
+  return `${mb.toFixed(0)}M`;
+}
+
+function fetchMemoryUsage() {
+  return new Promise((resolve) => {
+    execFile('top', ['-l', '1', '-n', '0'], (err, stdout) => {
+      if (err) return resolve(null);
+      const line = stdout.split('\n').find((l) => l.includes('PhysMem:'));
+      if (!line) return resolve(null);
+      const m = line.match(/PhysMem:\s*([\d.]+)([GMK])\s*used.*?,\s*([\d.]+)([GMK])\s*unused/i);
+      if (!m) return resolve(null);
+      const used = unitToBytes(m[1], m[2]);
+      const unused = unitToBytes(m[3], m[4]);
+      if (Number.isNaN(used) || Number.isNaN(unused)) return resolve(null);
+      const total = used + unused;
+      if (total <= 0) return resolve(null);
+      const pct = Math.round((used / total) * 100);
+      resolve({ used, total, pct });
+    });
+  });
+}
+
+function renderMemorySection(mem) {
+  const lines = [];
+  lines.push(COLOR.bold + 'Memory' + COLOR.reset);
+  if (!mem) {
+    lines.push(COLOR.dim + 'memory usage unavailable' + COLOR.reset);
+    return lines;
+  }
+  const barWidth = 30;
+  const bar = usageBar(mem.pct, barWidth);
+  const label = `${formatBytesShort(mem.used)}/${formatBytesShort(mem.total)}`;
+  lines.push(`${bar} ${pad(mem.pct + '%', 4)} ${COLOR.dim}${label} used${COLOR.reset}`);
+  return lines;
+}
+
 function fetchDiskUsage() {
   return new Promise((resolve) => {
     execFile('df', ['-h', '/'], (err, stdout) => {
@@ -522,13 +571,59 @@ function fetchAgents() {
   });
 }
 
-function render(agents, error, disk, diskIo, net) {
+// Tracks each session's last-known status (keyed by sessionId, falling back
+// to pid) across ticks so we can detect the moment a session transitions
+// INTO "waiting" — as opposed to already being/staying "waiting", which
+// would otherwise re-fire an alert on every single tick.
+const lastStatusBySession = new Map();
+let statusTrackingSeeded = false;
+const WAITING_ALERT_DISPLAY_MS = 5000;
+let waitingAlertBanner = null; // { message, expiresAt }
+
+function notifyWaiting(message) {
+  process.stdout.write('\x07');
+  execFile('osascript', ['-e', `display notification ${JSON.stringify(message)} with title "Claude Agents Dashboard"`], () => {});
+  waitingAlertBanner = { message, expiresAt: Date.now() + WAITING_ALERT_DISPLAY_MS };
+}
+
+// Compares this tick's agent statuses against the previous tick's to find
+// sessions that just transitioned into "waiting", firing alerts for those.
+// On the very first tick, statuses are only seeded (not compared), so
+// sessions already sitting in "waiting" at startup don't trigger a false
+// alert.
+function detectWaitingTransitions(agents) {
+  const seenIds = new Set();
+  for (const a of agents) {
+    const id = a.sessionId || a.pid;
+    seenIds.add(id);
+    const prevStatus = lastStatusBySession.get(id);
+    if (statusTrackingSeeded && prevStatus !== 'waiting' && a.status === 'waiting') {
+      const message = `${a.name || id} needs input: ${a.waitingFor || 'unknown'}`;
+      notifyWaiting(message);
+    }
+    lastStatusBySession.set(id, a.status);
+  }
+  // Clean up entries for sessions that no longer appear (session ended).
+  for (const id of lastStatusBySession.keys()) {
+    if (!seenIds.has(id)) lastStatusBySession.delete(id);
+  }
+  statusTrackingSeeded = true;
+}
+
+function render(agents, error, disk, diskIo, net, mem) {
   const cols = process.stdout.columns || 100;
   const lines = [];
   const title = ` Claude Agents Dashboard `;
   const now = new Date().toLocaleTimeString();
   lines.push(COLOR.bold + COLOR.cyan + title + COLOR.reset + COLOR.dim + `  refreshing every ${REFRESH_MS / 1000}s  •  ${now}` + COLOR.reset);
   lines.push('─'.repeat(Math.min(cols, 100)));
+
+  if (waitingAlertBanner && Date.now() < waitingAlertBanner.expiresAt) {
+    lines.push(COLOR.bold + COLOR.red + `⚠ ${waitingAlertBanner.message}` + COLOR.reset);
+    lines.push('');
+  } else if (waitingAlertBanner) {
+    waitingAlertBanner = null;
+  }
 
   if (error) {
     lines.push(COLOR.red + 'Error: ' + error + COLOR.reset);
@@ -577,6 +672,8 @@ function render(agents, error, disk, diskIo, net) {
   lines.push('─'.repeat(Math.min(cols, 100)));
   lines.push(...renderCpuSection(cols));
   lines.push('');
+  lines.push(...renderMemorySection(mem));
+  lines.push('');
   lines.push(...renderDiskSection(disk));
   lines.push('');
   lines.push(...renderDiskIoSection(diskIo));
@@ -598,24 +695,28 @@ let lastError = null;
 let lastDisk = null;
 let lastDiskIoStat = null;
 let lastNet = null;
+let lastMemory = null;
 
 function renderNow() {
-  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet);
+  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory);
 }
 
 async function tick() {
-  const [{ agents, error }, disk, diskIo, netTotals] = await Promise.all([
+  const [{ agents, error }, disk, diskIo, netTotals, mem] = await Promise.all([
     fetchAgents(),
     fetchDiskUsage(),
     fetchDiskIoRate(),
     fetchNetworkTotals(),
+    fetchMemoryUsage(),
   ]);
   lastAgents = agents || [];
   lastError = error;
   lastDisk = disk;
   lastDiskIoStat = diskIo;
   lastNet = networkRates(netTotals);
-  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet);
+  lastMemory = mem;
+  detectWaitingTransitions(lastAgents);
+  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory);
 }
 
 function cleanup() {
