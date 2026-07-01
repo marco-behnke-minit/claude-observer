@@ -412,6 +412,103 @@ function renderTokenSection(cols) {
   return lines;
 }
 
+function findSessionTranscript(sessionId) {
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  let projectDirs;
+  try {
+    projectDirs = fs.readdirSync(projectsDir);
+  } catch (e) {
+    return null;
+  }
+  for (const slug of projectDirs) {
+    const candidate = path.join(projectsDir, slug, `${sessionId}.jsonl`);
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch (e) {
+      // not this project
+    }
+  }
+  return null;
+}
+
+// A session's own transcript logs every sub-agent it dispatches (a
+// tool_use block named "Agent") immediately, but `claude agents --json`
+// has no visibility into them at all — they run inside the parent
+// process, not as separate OS-level sessions. Completion is logged
+// later as a queue-operation carrying a <task-notification> with a
+// matching <tool-use-id>. A dispatched id with no such notification
+// yet is still running.
+function activeSubAgentsForSession(sessionId) {
+  const filePath = findSessionTranscript(sessionId);
+  if (!filePath) return [];
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    return [];
+  }
+
+  const dispatched = new Map();
+  const resolved = new Set();
+  const errored = new Set();
+
+  for (const line of content.split('\n')) {
+    if (!line) continue;
+
+    if (line.includes('"tool_use"') && line.includes('"name":"Agent"')) {
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (e) {
+        continue;
+      }
+      const blocks = obj && obj.message && obj.message.content;
+      if (Array.isArray(blocks)) {
+        for (const block of blocks) {
+          if (block && block.type === 'tool_use' && block.name === 'Agent' && block.id) {
+            const desc = (block.input && (block.input.description || block.input.prompt)) || 'agent task';
+            const ts = new Date(obj.timestamp).getTime();
+            dispatched.set(block.id, { description: String(desc).slice(0, 40), startedAt: Number.isNaN(ts) ? Date.now() : ts });
+          }
+        }
+      }
+      continue;
+    }
+
+    // A dispatch that failed immediately (e.g. an isolation setup error)
+    // never actually starts a background task, so it will never receive
+    // a task-notification — it must be excluded explicitly via is_error,
+    // not just left to look perpetually "running".
+    if (line.includes('"is_error":true') && line.includes('"tool_use_id"')) {
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (e) {
+        continue;
+      }
+      const blocks = obj && obj.message && obj.message.content;
+      if (Array.isArray(blocks)) {
+        for (const block of blocks) {
+          if (block && block.is_error === true && block.tool_use_id) errored.add(block.tool_use_id);
+        }
+      }
+      continue;
+    }
+
+    if (line.includes('task-notification')) {
+      const m = line.match(/<tool-use-id>([^<]+)<\/tool-use-id>/);
+      if (m) resolved.add(m[1]);
+    }
+  }
+
+  const active = [];
+  for (const [id, info] of dispatched) {
+    if (resolved.has(id) || errored.has(id)) continue;
+    active.push(info);
+  }
+  return active.sort((a, b) => a.startedAt - b.startedAt);
+}
+
 function fetchAgents() {
   return new Promise((resolve) => {
     execFile('claude', ['agents', '--json', '--all'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
@@ -466,6 +563,13 @@ function render(agents, error, disk, diskIo, net) {
         shortenPath(a.cwd),
       ].join(' ');
       lines.push(row);
+
+      for (const sub of activeSubAgentsForSession(a.sessionId)) {
+        lines.push(
+          `  ${COLOR.dim}↳ ${COLOR.reset}${pad(sub.description, 40)} ` +
+          `${COLOR.yellow}running${COLOR.reset}  ${elapsed(sub.startedAt)}`
+        );
+      }
     }
   }
 
