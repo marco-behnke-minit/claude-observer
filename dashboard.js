@@ -3,8 +3,12 @@
 
 const { execFile } = require('child_process');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
 
 const REFRESH_MS = (Number(process.argv[2]) || 2) * 1000;
+const TOKEN_SCAN_MS = 30 * 1000;
 
 const COLOR = {
   reset: '\x1b[0m',
@@ -14,6 +18,7 @@ const COLOR = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
   gray: '\x1b[90m',
 };
 
@@ -132,6 +137,52 @@ function renderDiskSection(disk) {
   return lines;
 }
 
+let diskIoFetchInFlight = false;
+let lastDiskIo = null;
+
+function fetchDiskIoRate() {
+  if (diskIoFetchInFlight) return Promise.resolve(lastDiskIo);
+  diskIoFetchInFlight = true;
+  return new Promise((resolve) => {
+    execFile('iostat', ['-d', '-c', '2', '-w', '1'], (err, stdout) => {
+      diskIoFetchInFlight = false;
+      if (err) {
+        lastDiskIo = null;
+        return resolve(null);
+      }
+      const lines = stdout.trim().split('\n');
+      const lastLine = lines[lines.length - 1];
+      const nums = lastLine.trim().split(/\s+/).map(Number);
+      if (!nums.length || nums.some(Number.isNaN) || nums.length % 3 !== 0) {
+        lastDiskIo = null;
+        return resolve(null);
+      }
+      let mbps = 0;
+      let tps = 0;
+      for (let i = 0; i < nums.length; i += 3) {
+        tps += nums[i + 1];
+        mbps += nums[i + 2];
+      }
+      lastDiskIo = { mbps, tps };
+      resolve(lastDiskIo);
+    });
+  });
+}
+
+function renderDiskIoSection(diskIo) {
+  const lines = [];
+  lines.push(COLOR.bold + 'Disk I/O' + COLOR.reset);
+  if (!diskIo) {
+    lines.push(COLOR.dim + 'disk throughput unavailable' + COLOR.reset);
+    return lines;
+  }
+  lines.push(
+    `${COLOR.cyan}⇅${COLOR.reset} ${pad(diskIo.mbps.toFixed(2) + ' MB/s', 12)} ` +
+    `${pad(Math.round(diskIo.tps) + ' tps', 10)}`
+  );
+  return lines;
+}
+
 let prevNet = null;
 
 function fetchNetworkTotals() {
@@ -194,6 +245,173 @@ function renderNetworkSection(net) {
   return lines;
 }
 
+const TOKEN_RANGES = ['hour', 'day', 'week', 'month'];
+const TOKEN_RANGE_CONFIG = {
+  hour: { buckets: 60, bucketMs: 60 * 1000, label: 'hour' },
+  day: { buckets: 24, bucketMs: 60 * 60 * 1000, label: 'day' },
+  week: { buckets: 7, bucketMs: 24 * 60 * 60 * 1000, label: 'week' },
+  month: { buckets: 30, bucketMs: 24 * 60 * 60 * 1000, label: 'month' },
+};
+const SPARK_CHARS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+let currentRange = 'hour';
+// Cache covers the widest window (month, bucketed by day) plus we also keep
+// a fine-grained (per-minute, last hour) and per-hour (last day) cache so
+// each view can be re-bucketed cheaply without re-scanning files.
+let tokenCache = {
+  scannedAt: 0,
+  minuteBuckets: [], // last 60 minutes, index 0 = oldest
+  hourBuckets: [],   // last 24 hours
+  dayBuckets: [],    // last 30 days
+};
+
+function listTranscriptFiles() {
+  const files = [];
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  let projectDirs;
+  try {
+    projectDirs = fs.readdirSync(projectsDir);
+  } catch (e) {
+    return files;
+  }
+  for (const projectSlug of projectDirs) {
+    const projectPath = path.join(projectsDir, projectSlug);
+    let stat;
+    try {
+      stat = fs.statSync(projectPath);
+    } catch (e) {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    let entries;
+    try {
+      entries = fs.readdirSync(projectPath);
+    } catch (e) {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith('.jsonl')) continue;
+      const filePath = path.join(projectPath, entry);
+      try {
+        if (!fs.statSync(filePath).isFile()) continue;
+      } catch (e) {
+        continue;
+      }
+      files.push(filePath);
+    }
+  }
+  return files;
+}
+
+function tokensForUsage(usage) {
+  const fields = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
+  let sum = 0;
+  for (const f of fields) {
+    if (typeof usage[f] === 'number') sum += usage[f];
+  }
+  return sum;
+}
+
+// Scans all transcripts and buckets token usage into fixed-size rolling
+// windows: per-minute (60), per-hour (24), per-day (30). Runs on its own
+// slow cadence (TOKEN_SCAN_MS) since transcripts can be large/numerous.
+function scanTokenHistory() {
+  const now = Date.now();
+  const minuteMs = 60 * 1000;
+  const hourMs = 60 * 60 * 1000;
+  const dayMs = 24 * 60 * 60 * 1000;
+
+  const minuteBuckets = new Array(60).fill(0);
+  const hourBuckets = new Array(24).fill(0);
+  const dayBuckets = new Array(30).fill(0);
+
+  const minuteStart = now - 60 * minuteMs;
+  const hourStart = now - 24 * hourMs;
+  const dayStart = now - 30 * dayMs;
+
+  const files = listTranscriptFiles();
+  for (const filePath of files) {
+    let content;
+    try {
+      content = fs.readFileSync(filePath, 'utf8');
+    } catch (e) {
+      continue;
+    }
+    const lines = content.split('\n');
+    for (const line of lines) {
+      if (!line || !line.includes('"usage"')) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (e) {
+        continue;
+      }
+      const usage = obj && obj.message && obj.message.usage;
+      if (!usage || typeof usage !== 'object') continue;
+      if (!obj.timestamp) continue;
+      const ts = new Date(obj.timestamp).getTime();
+      if (Number.isNaN(ts)) continue;
+      const tokens = tokensForUsage(usage);
+      if (tokens <= 0) continue;
+
+      if (ts >= minuteStart && ts <= now) {
+        const idx = Math.min(59, Math.floor((ts - minuteStart) / minuteMs));
+        minuteBuckets[idx] += tokens;
+      }
+      if (ts >= hourStart && ts <= now) {
+        const idx = Math.min(23, Math.floor((ts - hourStart) / hourMs));
+        hourBuckets[idx] += tokens;
+      }
+      if (ts >= dayStart && ts <= now) {
+        const idx = Math.min(29, Math.floor((ts - dayStart) / dayMs));
+        dayBuckets[idx] += tokens;
+      }
+    }
+  }
+
+  tokenCache = { scannedAt: now, minuteBuckets, hourBuckets, dayBuckets };
+}
+
+function getTokenBuckets(range) {
+  if (range === 'hour') return tokenCache.minuteBuckets;
+  if (range === 'day') return tokenCache.hourBuckets;
+  if (range === 'week') return tokenCache.dayBuckets.slice(-7);
+  return tokenCache.dayBuckets; // month
+}
+
+function humanizeAgo(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
+function renderTokenSection(cols) {
+  const lines = [];
+  const cfg = TOKEN_RANGE_CONFIG[currentRange];
+  const buckets = getTokenBuckets(currentRange);
+  lines.push(COLOR.bold + COLOR.magenta + 'Token Spend' + COLOR.reset + `  [${currentRange}]  ` +
+    COLOR.dim + '(press h/d/w/m to switch, tab to cycle)' + COLOR.reset);
+
+  const max = Math.max(1, ...buckets);
+  const spark = buckets.map((v) => {
+    const level = Math.round((v / max) * (SPARK_CHARS.length - 1));
+    return SPARK_CHARS[level];
+  }).join('');
+  lines.push(COLOR.magenta + spark + COLOR.reset);
+
+  const total = buckets.reduce((a, b) => a + b, 0);
+  const windowMs = buckets.length * cfg.bucketMs;
+  const startLabel = humanizeAgo(windowMs) + ' ago';
+  lines.push(`${COLOR.dim}total:${COLOR.reset} ${total.toLocaleString()} tokens   ${startLabel} → now`);
+
+  return lines;
+}
+
 function fetchAgents() {
   return new Promise((resolve) => {
     execFile('claude', ['agents', '--json', '--all'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
@@ -207,7 +425,7 @@ function fetchAgents() {
   });
 }
 
-function render(agents, error, disk, net) {
+function render(agents, error, disk, diskIo, net) {
   const cols = process.stdout.columns || 100;
   const lines = [];
   const title = ` Claude Agents Dashboard `;
@@ -257,32 +475,95 @@ function render(agents, error, disk, net) {
   lines.push('');
   lines.push(...renderDiskSection(disk));
   lines.push('');
+  lines.push(...renderDiskIoSection(diskIo));
+  lines.push('');
   lines.push(...renderNetworkSection(net));
+  lines.push('');
+  lines.push(...renderTokenSection(cols));
 
   lines.push('');
-  lines.push(COLOR.dim + 'Ctrl+C to quit' + COLOR.reset);
+  lines.push(COLOR.dim + 'h/d/w/m switch range • q or Ctrl+C to quit' + COLOR.reset);
 
   process.stdout.write('\x1b[H\x1b[J' + lines.join('\n') + '\n');
 }
 
+// Last-known stats from the most recent tick(), kept so keypress-driven
+// range changes can re-render immediately without re-running subprocesses.
+let lastAgents = [];
+let lastError = null;
+let lastDisk = null;
+let lastDiskIoStat = null;
+let lastNet = null;
+
+function renderNow() {
+  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet);
+}
+
 async function tick() {
-  const [{ agents, error }, disk, netTotals] = await Promise.all([
+  const [{ agents, error }, disk, diskIo, netTotals] = await Promise.all([
     fetchAgents(),
     fetchDiskUsage(),
+    fetchDiskIoRate(),
     fetchNetworkTotals(),
   ]);
-  render(agents || [], error, disk, networkRates(netTotals));
+  lastAgents = agents || [];
+  lastError = error;
+  lastDisk = disk;
+  lastDiskIoStat = diskIo;
+  lastNet = networkRates(netTotals);
+  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet);
+}
+
+function cleanup() {
+  process.stdout.write('\x1b[?1049l\x1b[?25h');
+  process.exit(0);
+}
+
+function setupKeyboard() {
+  if (!process.stdin.isTTY) return;
+  readline.emitKeypressEvents(process.stdin);
+  process.stdin.setRawMode(true);
+  process.stdin.on('keypress', (str, key) => {
+    if (key && key.ctrl && key.name === 'c') return cleanup();
+    if (str === 'q') return cleanup();
+
+    let changed = false;
+    if (str === 'h') {
+      currentRange = 'hour';
+      changed = true;
+    } else if (str === 'd') {
+      currentRange = 'day';
+      changed = true;
+    } else if (str === 'w') {
+      currentRange = 'week';
+      changed = true;
+    } else if (str === 'm') {
+      currentRange = 'month';
+      changed = true;
+    } else if ((key && key.name === 'tab') || (key && key.name === 'right')) {
+      const idx = TOKEN_RANGES.indexOf(currentRange);
+      currentRange = TOKEN_RANGES[(idx + 1) % TOKEN_RANGES.length];
+      changed = true;
+    } else if (key && key.name === 'left') {
+      const idx = TOKEN_RANGES.indexOf(currentRange);
+      currentRange = TOKEN_RANGES[(idx - 1 + TOKEN_RANGES.length) % TOKEN_RANGES.length];
+      changed = true;
+    }
+
+    if (changed) renderNow();
+  });
 }
 
 function main() {
   process.stdout.write('\x1b[?1049h\x1b[?25l');
 
-  const cleanup = () => {
-    process.stdout.write('\x1b[?1049l\x1b[?25h');
-    process.exit(0);
-  };
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
+
+  setupKeyboard();
+
+  scanTokenHistory();
+  setInterval(scanTokenHistory, TOKEN_SCAN_MS);
 
   tick();
   setInterval(tick, REFRESH_MS);
