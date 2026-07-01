@@ -77,3 +77,7 @@ that were already waiting before the dashboard was started.
 - All system-vitals fetches run in parallel each tick; disk I/O sampling
   takes ~1s (`iostat -w 1`) but is guarded against overlapping calls if the
   refresh interval is set lower than that.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
