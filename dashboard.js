@@ -438,6 +438,9 @@ function humanizeAgo(ms) {
   return `${d}d`;
 }
 
+const SPARK_ROWS = 3;
+const SPARK_WIDTH_MULTIPLIER = 2;
+
 function renderTokenSection(cols) {
   const lines = [];
   const cfg = TOKEN_RANGE_CONFIG[currentRange];
@@ -445,12 +448,26 @@ function renderTokenSection(cols) {
   lines.push(COLOR.bold + COLOR.magenta + 'Token Spend' + COLOR.reset + `  [${currentRange}]  ` +
     COLOR.dim + '(press h/d/w/m to switch, tab to cycle)' + COLOR.reset);
 
+  // Stack SPARK_ROWS one-line sparklines to get real vertical resolution:
+  // each bucket's value maps to a 0..(SPARK_ROWS * 8) level, the bottom row
+  // draws the lowest 8 levels, the next row the next 8, and so on, using
+  // the same eighth-block characters for the fractional top of the bar.
+  // Each bucket is also drawn twice as wide, since a single character per
+  // bucket reads as too thin once the graph has real height.
   const max = Math.max(1, ...buckets);
-  const spark = buckets.map((v) => {
-    const level = Math.round((v / max) * (SPARK_CHARS.length - 1));
-    return SPARK_CHARS[level];
-  }).join('');
-  lines.push(COLOR.magenta + spark + COLOR.reset);
+  const totalLevels = SPARK_ROWS * SPARK_CHARS.length;
+  const levels = buckets.map((v) => Math.round((v / max) * totalLevels));
+
+  for (let row = 0; row < SPARK_ROWS; row++) {
+    const rowFloor = (SPARK_ROWS - 1 - row) * SPARK_CHARS.length;
+    let rowStr = '';
+    for (const level of levels) {
+      const filled = Math.max(0, Math.min(SPARK_CHARS.length, level - rowFloor));
+      const ch = filled === 0 ? ' ' : SPARK_CHARS[filled - 1];
+      rowStr += ch.repeat(SPARK_WIDTH_MULTIPLIER);
+    }
+    lines.push(COLOR.magenta + rowStr + COLOR.reset);
+  }
 
   const total = buckets.reduce((a, b) => a + b, 0);
   const windowMs = buckets.length * cfg.bucketMs;
@@ -758,8 +775,6 @@ function buildStatsColumn(disk, diskIo, net, mem, width) {
   lines.push(...renderDiskIoSection(diskIo));
   lines.push('');
   lines.push(...renderNetworkSection(net));
-  lines.push('');
-  lines.push(...renderTokenSection(width));
   return lines;
 }
 
@@ -802,6 +817,10 @@ function render(agents, error, disk, diskIo, net, mem, processTree) {
     lines.push('─'.repeat(Math.min(cols, 100)));
     lines.push(...rightLines);
   }
+
+  lines.push('');
+  lines.push('─'.repeat(Math.min(cols, 100)));
+  lines.push(...renderTokenSection(cols));
 
   lines.push('');
   lines.push(COLOR.dim + 'h/d/w/m switch range • q or Ctrl+C to quit' + COLOR.reset);
