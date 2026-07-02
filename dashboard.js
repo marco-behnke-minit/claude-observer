@@ -441,6 +441,38 @@ function humanizeAgo(ms) {
 const SPARK_ROWS = 3;
 const SPARK_WIDTH_MULTIPLIER = 2;
 
+function formatCompactNumber(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+const Y_AXIS_WIDTH = 7; // label chars + 1 tick-glyph column
+
+function padLeft(str, len) {
+  return ' '.repeat(Math.max(0, len - str.length)) + str;
+}
+
+// A row of time-ago labels under the bars: window-start, three evenly
+// spaced points in between, and "now" pinned to the right edge — so you
+// can tell where each bar actually falls in time without hovering.
+function buildTimeAxis(n, bucketMs, widthMultiplier) {
+  const totalWidth = n * widthMultiplier;
+  const chars = new Array(totalWidth).fill(' ');
+  const positions = n >= 10 ? [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor((3 * n) / 4), n - 1] : [0, Math.floor(n / 2), n - 1];
+  positions.forEach((idx, i) => {
+    const isLast = i === positions.length - 1;
+    const label = isLast ? 'now' : '-' + humanizeAgo((n - idx) * bucketMs);
+    let col = isLast ? totalWidth - label.length : idx * widthMultiplier;
+    for (let j = 0; j < label.length; j++) {
+      const c = col + j;
+      if (c >= 0 && c < totalWidth) chars[c] = label[j];
+    }
+  });
+  return chars.join('');
+}
+
 function renderTokenSection(cols) {
   const lines = [];
   const cfg = TOKEN_RANGE_CONFIG[currentRange];
@@ -466,8 +498,18 @@ function renderTokenSection(cols) {
       const ch = filled === 0 ? ' ' : SPARK_CHARS[filled - 1];
       rowStr += ch.repeat(SPARK_WIDTH_MULTIPLIER);
     }
-    lines.push(COLOR.magenta + rowStr + COLOR.reset);
+
+    const label = row === 0 ? formatCompactNumber(max) : '';
+    const glyph = row === 0 ? '┤' : '│';
+    const gutter = padLeft(label, Y_AXIS_WIDTH - 1) + glyph;
+    lines.push(COLOR.dim + gutter + COLOR.reset + COLOR.magenta + rowStr + COLOR.reset);
   }
+
+  const barWidth = buckets.length * SPARK_WIDTH_MULTIPLIER;
+  const baseline = padLeft('0', Y_AXIS_WIDTH - 1) + '└' + '─'.repeat(barWidth);
+  lines.push(COLOR.dim + baseline + COLOR.reset);
+
+  lines.push(' '.repeat(Y_AXIS_WIDTH) + COLOR.dim + buildTimeAxis(buckets.length, cfg.bucketMs, SPARK_WIDTH_MULTIPLIER) + COLOR.reset);
 
   const total = buckets.reduce((a, b) => a + b, 0);
   const windowMs = buckets.length * cfg.bucketMs;
