@@ -30,10 +30,9 @@ const STATUS_COLOR = {
   completed: COLOR.green,
 };
 
-function shortenPath(p) {
+function shortenPath(p, max = 46) {
   const home = process.env.HOME || '';
   if (home && p.startsWith(home)) p = '~' + p.slice(home.length);
-  const max = 46;
   if (p.length <= max) return p;
   return COLOR.dim + '…' + COLOR.reset + p.slice(-(max - 1));
 }
@@ -619,15 +618,16 @@ function buildProcessTree(pid, childrenByPpid, visited, depth = 0, maxDepth = 8)
   return nodes;
 }
 
-function renderProcessTree(nodes, depth, lines) {
+function renderProcessTree(nodes, depth, lines, width) {
   for (const node of nodes) {
     const indent = '  '.repeat(depth + 1);
-    const label = shortenCommand(node.command, Math.max(20, 48 - depth * 2));
     const suffix = node.count > 1
       ? ` ${COLOR.dim}×${node.count}${COLOR.reset}`
       : ` ${COLOR.dim}(pid ${node.pid})${COLOR.reset}`;
+    const budget = width - indent.length - 2 - 12; // icon + reserved space for the suffix
+    const label = shortenCommand(node.command, Math.max(12, budget));
     lines.push(`${indent}${COLOR.cyan}⚙ ${COLOR.reset}${label}${suffix}`);
-    renderProcessTree(node.children, depth + 1, lines);
+    renderProcessTree(node.children, depth + 1, lines, width);
   }
 }
 
@@ -691,21 +691,10 @@ function detectWaitingTransitions(agents) {
   statusTrackingSeeded = true;
 }
 
-function render(agents, error, disk, diskIo, net, mem, processTree) {
-  const cols = process.stdout.columns || 100;
+// Agent sessions, their sub-agents, and their spawned process trees —
+// the "what's actually running" column.
+function buildAgentsColumn(agents, error, processTree, width) {
   const lines = [];
-  const title = ` Claude Agents Dashboard `;
-  const now = new Date().toLocaleTimeString();
-  lines.push(COLOR.bold + COLOR.cyan + title + COLOR.reset + COLOR.dim + `  refreshing every ${REFRESH_MS / 1000}s  •  ${now}` + COLOR.reset);
-  lines.push('─'.repeat(Math.min(cols, 100)));
-
-  if (waitingAlertBanner && Date.now() < waitingAlertBanner.expiresAt) {
-    lines.push(COLOR.bold + COLOR.red + `⚠ ${waitingAlertBanner.message}` + COLOR.reset);
-    lines.push('');
-  } else if (waitingAlertBanner) {
-    waitingAlertBanner = null;
-  }
-
   if (error) {
     lines.push(COLOR.red + 'Error: ' + error + COLOR.reset);
   } else if (!agents.length) {
@@ -717,6 +706,9 @@ function render(agents, error, disk, diskIo, net, mem, processTree) {
       if (oa !== ob) return oa - ob;
       return b.startedAt - a.startedAt;
     });
+
+    const fixedWidths = 20 + 1 + 12 + 1 + 22 + 1 + 9 + 1 + 8 + 1; // NAME STATUS DETAIL ELAPSED PID + gaps
+    const projectWidth = Math.max(10, width - fixedWidths);
 
     const header = [
       pad('NAME', 20),
@@ -736,7 +728,7 @@ function render(agents, error, disk, diskIo, net, mem, processTree) {
         pad((a.waitingFor || '-').slice(0, 22), 22),
         pad(elapsed(a.startedAt), 9),
         pad(String(a.pid), 8),
-        shortenPath(a.cwd),
+        shortenPath(a.cwd, projectWidth),
       ].join(' ');
       lines.push(row);
 
@@ -748,13 +740,16 @@ function render(agents, error, disk, diskIo, net, mem, processTree) {
       }
 
       const procTree = buildProcessTree(a.pid, processTree, new Set([a.pid]));
-      renderProcessTree(procTree, 0, lines);
+      renderProcessTree(procTree, 0, lines, width);
     }
   }
+  return lines;
+}
 
-  lines.push('');
-  lines.push('─'.repeat(Math.min(cols, 100)));
-  lines.push(...renderCpuSection(cols));
+// CPU/memory/disk/network/token-spend — the "system vitals" column.
+function buildStatsColumn(disk, diskIo, net, mem, width) {
+  const lines = [];
+  lines.push(...renderCpuSection(width));
   lines.push('');
   lines.push(...renderMemorySection(mem));
   lines.push('');
@@ -764,7 +759,49 @@ function render(agents, error, disk, diskIo, net, mem, processTree) {
   lines.push('');
   lines.push(...renderNetworkSection(net));
   lines.push('');
-  lines.push(...renderTokenSection(cols));
+  lines.push(...renderTokenSection(width));
+  return lines;
+}
+
+// Below a minimum width, a side-by-side layout would squeeze both columns
+// into illegibility, so fall back to the original stacked single-column
+// layout instead of forcing a split that doesn't fit.
+const MIN_SPLIT_COLS = 90;
+const COLUMN_GUTTER = 3;
+
+function render(agents, error, disk, diskIo, net, mem, processTree) {
+  const cols = process.stdout.columns || 100;
+  const lines = [];
+  const title = ` Claude Agents Dashboard `;
+  const now = new Date().toLocaleTimeString();
+  lines.push(COLOR.bold + COLOR.cyan + title + COLOR.reset + COLOR.dim + `  refreshing every ${REFRESH_MS / 1000}s  •  ${now}` + COLOR.reset);
+  lines.push('─'.repeat(Math.min(cols, 100)));
+
+  if (waitingAlertBanner && Date.now() < waitingAlertBanner.expiresAt) {
+    lines.push(COLOR.bold + COLOR.red + `⚠ ${waitingAlertBanner.message}` + COLOR.reset);
+    lines.push('');
+  } else if (waitingAlertBanner) {
+    waitingAlertBanner = null;
+  }
+
+  const splitLayout = cols >= MIN_SPLIT_COLS;
+  const rightWidth = splitLayout ? Math.min(64, Math.max(50, Math.floor(cols * 0.38))) : Math.min(cols, 100);
+  const leftWidth = splitLayout ? (cols - rightWidth - COLUMN_GUTTER) : Math.min(cols, 100);
+
+  const leftLines = buildAgentsColumn(agents, error, processTree, leftWidth);
+  const rightLines = buildStatsColumn(disk, diskIo, net, mem, rightWidth);
+
+  if (splitLayout) {
+    const rowCount = Math.max(leftLines.length, rightLines.length);
+    for (let i = 0; i < rowCount; i++) {
+      lines.push(pad(leftLines[i] || '', leftWidth) + ' '.repeat(COLUMN_GUTTER) + (rightLines[i] || ''));
+    }
+  } else {
+    lines.push(...leftLines);
+    lines.push('');
+    lines.push('─'.repeat(Math.min(cols, 100)));
+    lines.push(...rightLines);
+  }
 
   lines.push('');
   lines.push(COLOR.dim + 'h/d/w/m switch range • q or Ctrl+C to quit' + COLOR.reset);
