@@ -558,6 +558,87 @@ function activeSubAgentsForSession(sessionId) {
   return active.sort((a, b) => a.startedAt - b.startedAt);
 }
 
+// A session's Bash tool calls (and anything a sub-agent dispatched within
+// it runs) become real OS child processes of that session's own pid —
+// confirmed by tracing a live `turbo` build back to its owning session.
+// Build a ppid -> children adjacency list once per tick so each session
+// row can cheaply walk its own descendants.
+function fetchProcessTree() {
+  return new Promise((resolve) => {
+    execFile('ps', ['-eo', 'pid,ppid,command'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return resolve(new Map());
+      const childrenByPpid = new Map();
+      for (const line of stdout.split('\n').slice(1)) {
+        const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+        if (!m) continue;
+        const pid = Number(m[1]);
+        const ppid = Number(m[2]);
+        const command = m[3];
+        if (!childrenByPpid.has(ppid)) childrenByPpid.set(ppid, []);
+        childrenByPpid.get(ppid).push({ pid, command });
+      }
+      resolve(childrenByPpid);
+    });
+  });
+}
+
+// Builds the actual process tree rooted at `pid` (not a flattened list) so
+// e.g. a `turbo run test` node correctly shows its jest-worker processes
+// as ITS children rather than as unrelated siblings of the session.
+// Sibling processes with identical command lines are split into two
+// buckets: those with no children of their own collapse into one node
+// with a count (e.g. a dozen indistinguishable jest workers), while any
+// sibling that DOES have children is always shown on its own line with
+// its subtree attached — so collapsing duplicates never hides a real
+// descendant (e.g. one jest worker that happens to shell out to `git`).
+function buildProcessTree(pid, childrenByPpid, visited, depth = 0, maxDepth = 8) {
+  if (depth >= maxDepth) return [];
+  const kids = (childrenByPpid.get(pid) || []).filter((k) => !visited.has(k.pid));
+  const groups = new Map();
+  for (const kid of kids) {
+    visited.add(kid.pid);
+    if (!groups.has(kid.command)) groups.set(kid.command, []);
+    groups.get(kid.command).push(kid);
+  }
+
+  const nodes = [];
+  for (const members of groups.values()) {
+    const leaves = [];
+    for (const m of members) {
+      const subtree = buildProcessTree(m.pid, childrenByPpid, visited, depth + 1, maxDepth);
+      if (subtree.length > 0) {
+        nodes.push({ command: m.command, pid: m.pid, count: 1, children: subtree });
+      } else {
+        leaves.push(m);
+      }
+    }
+    if (leaves.length > 0) {
+      nodes.push({ command: leaves[0].command, pid: leaves[0].pid, count: leaves.length, children: [] });
+    }
+  }
+  return nodes;
+}
+
+function renderProcessTree(nodes, depth, lines) {
+  for (const node of nodes) {
+    const indent = '  '.repeat(depth + 1);
+    const label = shortenCommand(node.command, Math.max(20, 48 - depth * 2));
+    const suffix = node.count > 1
+      ? ` ${COLOR.dim}×${node.count}${COLOR.reset}`
+      : ` ${COLOR.dim}(pid ${node.pid})${COLOR.reset}`;
+    lines.push(`${indent}${COLOR.cyan}⚙ ${COLOR.reset}${label}${suffix}`);
+    renderProcessTree(node.children, depth + 1, lines);
+  }
+}
+
+function shortenCommand(command, maxLen) {
+  const parts = command.trim().split(/\s+/);
+  if (parts.length && parts[0]) parts[0] = path.basename(parts[0]);
+  const joined = parts.join(' ');
+  if (joined.length <= maxLen) return joined;
+  return joined.slice(0, maxLen - 1) + '…';
+}
+
 function fetchAgents() {
   return new Promise((resolve) => {
     execFile('claude', ['agents', '--json', '--all'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
@@ -610,7 +691,7 @@ function detectWaitingTransitions(agents) {
   statusTrackingSeeded = true;
 }
 
-function render(agents, error, disk, diskIo, net, mem) {
+function render(agents, error, disk, diskIo, net, mem, processTree) {
   const cols = process.stdout.columns || 100;
   const lines = [];
   const title = ` Claude Agents Dashboard `;
@@ -665,6 +746,9 @@ function render(agents, error, disk, diskIo, net, mem) {
           `${COLOR.yellow}running${COLOR.reset}  ${elapsed(sub.startedAt)}`
         );
       }
+
+      const procTree = buildProcessTree(a.pid, processTree, new Set([a.pid]));
+      renderProcessTree(procTree, 0, lines);
     }
   }
 
@@ -696,18 +780,20 @@ let lastDisk = null;
 let lastDiskIoStat = null;
 let lastNet = null;
 let lastMemory = null;
+let lastProcessTree = new Map();
 
 function renderNow() {
-  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory);
+  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory, lastProcessTree);
 }
 
 async function tick() {
-  const [{ agents, error }, disk, diskIo, netTotals, mem] = await Promise.all([
+  const [{ agents, error }, disk, diskIo, netTotals, mem, processTree] = await Promise.all([
     fetchAgents(),
     fetchDiskUsage(),
     fetchDiskIoRate(),
     fetchNetworkTotals(),
     fetchMemoryUsage(),
+    fetchProcessTree(),
   ]);
   lastAgents = agents || [];
   lastError = error;
@@ -715,8 +801,9 @@ async function tick() {
   lastDiskIoStat = diskIo;
   lastNet = networkRates(netTotals);
   lastMemory = mem;
+  lastProcessTree = processTree;
   detectWaitingTransitions(lastAgents);
-  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory);
+  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory, lastProcessTree);
 }
 
 function cleanup() {
