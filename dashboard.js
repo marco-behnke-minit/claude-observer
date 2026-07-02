@@ -538,6 +538,41 @@ function findSessionTranscript(sessionId) {
   return null;
 }
 
+// `claude agents --json` has no model field, but every assistant message
+// in the session's own transcript carries the model it was generated
+// with — scan backward for the most recent one to get the session's
+// current model.
+function currentModelForSession(sessionId) {
+  const filePath = findSessionTranscript(sessionId);
+  if (!filePath) return null;
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    return null;
+  }
+  const lines = content.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !line.includes('"model"')) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch (e) {
+      continue;
+    }
+    if (obj.type === 'assistant' && obj.message && obj.message.model) {
+      return obj.message.model;
+    }
+  }
+  return null;
+}
+
+function shortenModelName(model) {
+  if (!model) return '-';
+  return model.replace(/^claude-/, '').replace(/-\d{6,}$/, '');
+}
+
 // A session's own transcript logs every sub-agent it dispatches (a
 // tool_use block named "Agent") immediately, but `claude agents --json`
 // has no visibility into them at all — they run inside the parent
@@ -766,12 +801,13 @@ function buildAgentsColumn(agents, error, processTree, width) {
       return b.startedAt - a.startedAt;
     });
 
-    const fixedWidths = 20 + 1 + 12 + 1 + 22 + 1 + 9 + 1 + 8 + 1; // NAME STATUS DETAIL ELAPSED PID + gaps
+    const fixedWidths = 20 + 1 + 12 + 1 + 10 + 1 + 22 + 1 + 9 + 1 + 8 + 1; // NAME STATUS MODEL DETAIL ELAPSED PID + gaps
     const projectWidth = Math.max(10, width - fixedWidths);
 
     const header = [
       pad('NAME', 20),
       pad('STATUS', 12),
+      pad('MODEL', 10),
       pad('DETAIL', 22),
       pad('ELAPSED', 9),
       pad('PID', 8),
@@ -781,9 +817,11 @@ function buildAgentsColumn(agents, error, processTree, width) {
 
     for (const a of sorted) {
       const statusColor = STATUS_COLOR[a.status] || COLOR.reset;
+      const model = shortenModelName(currentModelForSession(a.sessionId));
       const row = [
         pad((a.name || '').slice(0, 20), 20),
         pad(statusColor + a.status + COLOR.reset, 12),
+        pad(model.slice(0, 10), 10),
         pad((a.waitingFor || '-').slice(0, 22), 22),
         pad(elapsed(a.startedAt), 9),
         pad(String(a.pid), 8),
