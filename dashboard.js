@@ -31,6 +31,10 @@ const { flags, positional } = parseArgs();
 const HUB_URL = (flags.hub || process.env.CLAUDE_OBSERVER_HUB_URL || '').replace(/\/$/, '');
 const TOKEN = flags.token || process.env.CLAUDE_OBSERVER_TOKEN;
 const REFRESH_MS = (Number(positional) || 2) * 1000;
+// Machines stale for longer than this disappear from the view entirely
+// (replaced by a one-line count, so they don't vanish silently). Unset =
+// never hide, only gray out — the default.
+const HIDE_STALE_MS = (Number(flags['hide-stale-after'] || process.env.CLAUDE_OBSERVER_HIDE_STALE_S) || 0) * 1000;
 
 if (!HUB_URL || !TOKEN) {
   console.error('hub URL and token are required: --hub <url> --token <t> (or CLAUDE_OBSERVER_HUB_URL / CLAUDE_OBSERVER_TOKEN)');
@@ -591,12 +595,16 @@ function render() {
   if (!lastHubResponse) {
     if (!lastPollError) lines.push(COLOR.dim + 'connecting to hub…' + COLOR.reset);
   } else {
-    const machines = [...(lastHubResponse.machines || [])].sort((a, b) => {
+    const all = lastHubResponse.machines || [];
+    // Only ever hide machines that are already past the hub's stale
+    // threshold — a hide window shorter than that can't un-gray anything.
+    const hidden = HIDE_STALE_MS > 0 ? all.filter((m) => m.stale && liveAgeMs(m) > HIDE_STALE_MS) : [];
+    const machines = all.filter((m) => !hidden.includes(m)).sort((a, b) => {
       if (a.stale !== b.stale) return a.stale ? 1 : -1;
       return a.machine.localeCompare(b.machine);
     });
 
-    if (!machines.length) {
+    if (!machines.length && !hidden.length) {
       lines.push(COLOR.dim + 'No machines have reported yet.' + COLOR.reset);
     }
 
@@ -607,6 +615,12 @@ function render() {
       }
       lines.push(...renderMachineSection(m, cols));
     });
+
+    if (hidden.length) {
+      lines.push('');
+      const names = hidden.map((m) => m.machine).join(', ');
+      lines.push(COLOR.dim + `○ ${hidden.length} stale machine${hidden.length === 1 ? '' : 's'} hidden (offline > ${humanizeAgo(HIDE_STALE_MS)}): ${names}` + COLOR.reset);
+    }
   }
 
   lines.push('');

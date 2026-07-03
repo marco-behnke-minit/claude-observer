@@ -199,12 +199,16 @@ loader to stay single-file deployable.
 | hub | `--stale-after <s>` | `CLAUDE_OBSERVER_STALE_S` | 15 |
 | hub | `--bind <addr>` | `CLAUDE_OBSERVER_HUB_BIND` | `127.0.0.1` |
 | dashboard | `--hub <url>`, `--token <t>` | same as above | required, no default |
+| dashboard | `--hide-stale-after <s>` | `CLAUDE_OBSERVER_HIDE_STALE_S` | unset (never hide) |
 | dashboard | positional refresh-seconds (unchanged) | — | 2 |
 
 ## Edge cases handled
 
-- **Stale machine**: shown grayed out with "last seen Ns ago", never hidden — a dead
-  reporter is exactly when you most want visibility.
+- **Stale machine**: shown grayed out with "last seen Ns ago" — a dead reporter is
+  exactly when you most want visibility. With `--hide-stale-after <s>` set on the
+  dashboard, machines stale for longer than that collapse into a one-line hidden
+  count naming them (never a silent disappearance); they reappear automatically when
+  their reporter comes back.
 - **Reconnect after outage**: transition tracking frozen while stale, so coming back
   online isn't misread as a fresh waiting-transition.
 - **Rendering volume with many machines**: no collapsing/pagination in v1 (full

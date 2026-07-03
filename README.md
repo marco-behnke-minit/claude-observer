@@ -59,7 +59,9 @@ Per machine (online machines first, stale ones grayed out at the bottom):
 **Header** — `● name · last seen 2s ago · 3 sessions`, flipping to a red `○`
 with a staleness note when the machine's reporter stops reporting (last-known
 data stays visible, dimmed — a dead reporter is exactly when you want
-visibility, not a blank).
+visibility, not a blank). With `--hide-stale-after <seconds>`, machines
+offline longer than that collapse into a one-line hidden count instead of
+taking up a full section.
 
 **Agent sessions** — every Claude Code session with status (waiting → busy →
 idle → completed), current model, elapsed time, and project path. Under each
@@ -110,6 +112,7 @@ directory, see `.env.template`) wins over default:
 | hub | `--token <t>` | `CLAUDE_OBSERVER_TOKEN` | required |
 | hub | `--stale-after <s>` | `CLAUDE_OBSERVER_STALE_S` | 15 |
 | dashboard | `--hub <url>`, `--token <t>` | same as reporter | required |
+| dashboard | `--hide-stale-after <s>` | `CLAUDE_OBSERVER_HIDE_STALE_S` | never hide |
 | dashboard | positional first arg | — | refresh seconds, default 2 |
 
 ## Docker (hub and dashboard)
