@@ -1,82 +1,127 @@
 # claude-observer
 
-A single-file, dependency-free terminal dashboard for observing Claude Code
-background activity — every agent session across every project, plus basic
-system vitals — refreshing live in your terminal.
+A dependency-free terminal dashboard for observing Claude Code agent activity
+across **all your machines** — every agent session, the sub-agents and
+processes it spawned, system vitals, and token spend, aggregated in one live
+view with alerts when any session needs your input.
 
-Built because `claude agents` (Claude Code's own background-session view)
-didn't render as an interactive TUI in every terminal setup, and gave no
-visibility into sub-agents spawned *within* a session or into system
-resource usage while agents are running.
-
-## Requirements
-
-- macOS (uses `top`, `df`, `iostat`, `netstat` — all macOS-flavored output
-  parsing, not portable to Linux/Windows as-is)
-- Node.js (no npm install, no dependencies — just built-in modules)
-- The `claude` CLI available on `PATH`
-
-## Usage
+Three small Node processes, no npm packages:
 
 ```
-node dashboard.js          # refreshes every 2s
-node dashboard.js 5        # refresh every 5s
+┌────────────┐  POST /report   ┌─────────┐  GET /snapshot  ┌───────────┐
+│ reporter.js│ ───────────────▶│  hub.js │ ◀────────────── │dashboard.js│
+│ (each mac) │    every 3s     │(always- │    every 2s     │ (wherever  │
+└────────────┘                 │  on)    │                 │  you are)  │
+      ⋮ more machines ────────▶└─────────┘                 └───────────┘
 ```
 
-For live development, run it under Node's built-in watch mode so it
-restarts automatically on save:
+- **`reporter.js`** runs on every machine with Claude Code sessions: collects
+  agent sessions (`claude agents --json`), in-flight sub-agents and current
+  model (from session transcripts), spawned process trees, CPU/memory/disk/
+  network vitals, and token-spend history, then pushes a compact JSON snapshot
+  to the hub. Push-based, so machines behind NAT/firewalls work — only
+  outbound access to the hub is needed.
+- **`hub.js`** is a tiny always-on HTTP server holding the latest snapshot per
+  machine in memory. Self-contained single file — deploy it by copying it to
+  the server. Speaks plain HTTP on `127.0.0.1` by default; put a TLS reverse
+  proxy (e.g. Apache/nginx/Caddy) in front for internet exposure.
+- **`dashboard.js`** is the terminal UI: pulls the aggregated snapshot from the
+  hub and renders one section per machine. It never collects anything locally —
+  even single-machine use runs a local reporter + hub.
 
+## Quick start (single machine, all three locally)
+
+```sh
+node hub.js --token mysecret &
+node reporter.js --hub http://127.0.0.1:7345 --token mysecret &
+node dashboard.js --hub http://127.0.0.1:7345 --token mysecret
 ```
-node --watch --watch-preserve-output dashboard.js
+
+Add machines by running another `reporter.js` on each, pointed at the same
+hub (via its public HTTPS URL if proxied):
+
+```sh
+node reporter.js --hub https://hub.example.com/observer --token mysecret \
+  --name mac-mini --ssh-hint marco@mini.local
 ```
 
-Press `q` or `Ctrl+C` to quit — the dashboard uses the terminal's alternate
-screen buffer, so quitting restores your normal scrollback.
+Press `q` or `Ctrl+C` to quit the dashboard — it uses the terminal's alternate
+screen buffer, so quitting restores your scrollback.
 
-## What it shows
+## What the dashboard shows
 
-**Agent sessions** — every background Claude Code session across all
-projects (from `claude agents --json --all`), sorted by state (waiting →
-busy → idle → completed), with name, status, elapsed time, PID, and project
-path. Sessions that are dispatching their own sub-agents (via the Agent
-tool) show them nested underneath as `↳` rows — `claude agents` itself has
-no visibility into those, since they run inside the parent process rather
-than as separate OS-level sessions, so their live/finished state is
-reconstructed by reading the session's own transcript.
+Per machine (online machines first, stale ones grayed out at the bottom):
 
-**System vitals** — CPU usage per core, memory (matching Activity Monitor's
-accounting, not Node's misleading `os.freemem()`), disk usage and I/O
-throughput, and network RX/TX.
+**Header** — `● name · last seen 2s ago · 3 sessions`, flipping to a red `○`
+with a staleness note when the machine's reporter stops reporting (last-known
+data stays visible, dimmed — a dead reporter is exactly when you want
+visibility, not a blank).
 
-**Token spend** — a sparkline of token usage mined from
-`~/.claude/projects/*/*.jsonl` transcripts across all projects, switchable
-between four rolling windows:
+**Agent sessions** — every Claude Code session with status (waiting → busy →
+idle → completed), current model, elapsed time, and project path. Under each
+session: a ready-to-copy `ssh <hint> 'claude attach <sessionId>'` line to jump
+into it, in-flight sub-agents as `↳` rows (reconstructed from the session's
+transcript — `claude agents` itself can't see them), and the real process tree
+of everything the session spawned (builds, tests, servers), with identical
+sibling processes collapsed into `×N` rows.
 
-| Key       | Range | Bucketed by |
-|-----------|-------|-------------|
-| `h`       | last hour  | minute |
-| `d`       | last day   | hour   |
-| `w`       | last week  | day    |
-| `m`       | last month | day    |
+**System vitals** — CPU per core, memory (Activity Monitor's accounting, not
+Node's misleading `os.freemem()`), disk usage and I/O throughput, network
+RX/TX.
 
-`Tab`/`→` and `←` cycle through the ranges. The underlying scan runs on its
-own 30s cadence (independent of the display refresh) since transcripts can
-be large.
+**Token spend** — a bar chart with time/value axes of token usage mined from
+that machine's `~/.claude/projects/*/*.jsonl` transcripts, switchable between
+four rolling windows:
 
-**Waiting alert** — the moment any session transitions into `waiting`
+| Key | Range | Bucketed by |
+|-----|-------|-------------|
+| `h` | last hour  | minute |
+| `d` | last day   | hour   |
+| `w` | last week  | day    |
+| `m` | last month | day    |
+
+`Tab`/`→` and `←` cycle through the ranges.
+
+**Alerts** — the moment any session on any machine transitions into `waiting`
 (needs a permission prompt or other input), the dashboard fires a terminal
-bell, a macOS notification, and a short-lived on-screen banner. It only
-fires on the transition, not on every tick, and doesn't fire for sessions
-that were already waiting before the dashboard was started.
+bell, a macOS notification, and an on-screen banner naming the machine and
+session. Same mechanism fires once when a machine goes offline. Edge-triggered:
+no re-alerting every refresh, and nothing fires for sessions already waiting
+when the dashboard starts.
+
+## Configuration
+
+CLI flag wins over env var wins over default:
+
+| Process | Flag | Env var | Default |
+|---|---|---|---|
+| reporter | `--hub <url>` | `CLAUDE_OBSERVER_HUB_URL` | required |
+| reporter | `--token <t>` | `CLAUDE_OBSERVER_TOKEN` | required |
+| reporter | `--name <n>` | `CLAUDE_OBSERVER_MACHINE` | hostname |
+| reporter | `--ssh-hint <s>` | `CLAUDE_OBSERVER_SSH_HINT` | none (falls back to name) |
+| reporter | `--interval <s>` | `CLAUDE_OBSERVER_PUSH_INTERVAL_S` | 3 |
+| hub | `--port <p>` | `CLAUDE_OBSERVER_HUB_PORT` | 7345 |
+| hub | `--bind <addr>` | `CLAUDE_OBSERVER_HUB_BIND` | `127.0.0.1` |
+| hub | `--token <t>` | `CLAUDE_OBSERVER_TOKEN` | required |
+| hub | `--stale-after <s>` | `CLAUDE_OBSERVER_STALE_S` | 15 |
+| dashboard | `--hub <url>`, `--token <t>` | same as reporter | required |
+| dashboard | positional first arg | — | refresh seconds, default 2 |
 
 ## Notes
 
-- Nothing here is a general-purpose systems tool — the shell commands
-  (`iostat`, `netstat -ib`, `top -l 1`, `df -h`) are parsed for their macOS
-  output format specifically.
-- All system-vitals fetches run in parallel each tick; disk I/O sampling
-  takes ~1s (`iostat -w 1`) but is guarded against overlapping calls if the
-  refresh interval is set lower than that.
+- **Reporters are macOS-only** — they parse macOS-flavored `top`, `iostat`,
+  `netstat`, `df`, `ps` output. The **hub runs anywhere** Node runs (it's pure
+  `http`, typically a Linux server). The dashboard renders anywhere, though
+  its desktop notifications use macOS `osascript` (bell and banner still work
+  elsewhere).
+- The hub is in-memory only: a restart just means machines reappear within one
+  push interval. Reporters are self-healing too — a failed push is simply
+  superseded by the next full snapshot.
+- Security model: one shared bearer token for pushes and reads, TLS via your
+  reverse proxy. Snapshots include command lines and paths from your machines
+  — the reporter prunes the process tree to agent-spawned processes only and
+  truncates commands, so unrelated processes never leave the machine.
+- See `TECH.md` for the full architecture and payload schema.
 
 ## License
 

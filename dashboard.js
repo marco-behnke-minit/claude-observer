@@ -1,14 +1,38 @@
 #!/usr/bin/env node
 'use strict';
 
-const { execFile } = require('child_process');
-const os = require('os');
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline');
+// Terminal dashboard for claude-observer. Renders the aggregated
+// multi-machine view pulled from the hub — it never collects anything
+// locally; every machine (including this one) reports via reporter.js.
 
-const REFRESH_MS = (Number(process.argv[2]) || 2) * 1000;
-const TOKEN_SCAN_MS = 30 * 1000;
+const { execFile } = require('child_process');
+const readline = require('readline');
+const { SCHEMA_VERSION, buildProcessTree, inflateProcessTree, requestJson } = require('./collector');
+
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const flags = {};
+  let positional = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith('--')) {
+      flags[args[i].slice(2)] = args[i + 1];
+      i++;
+    } else if (positional === null) {
+      positional = args[i];
+    }
+  }
+  return { flags, positional };
+}
+
+const { flags, positional } = parseArgs();
+const HUB_URL = (flags.hub || process.env.CLAUDE_OBSERVER_HUB_URL || '').replace(/\/$/, '');
+const TOKEN = flags.token || process.env.CLAUDE_OBSERVER_TOKEN;
+const REFRESH_MS = (Number(positional) || 2) * 1000;
+
+if (!HUB_URL || !TOKEN) {
+  console.error('hub URL and token are required: --hub <url> --token <t> (or CLAUDE_OBSERVER_HUB_URL / CLAUDE_OBSERVER_TOKEN)');
+  process.exit(1);
+}
 
 const COLOR = {
   reset: '\x1b[0m',
@@ -30,13 +54,45 @@ const STATUS_COLOR = {
   completed: COLOR.green,
 };
 
+// ---------------------------------------------------------------------------
+// Text helpers
+
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
+function stripAnsi(str) {
+  return str.replace(ANSI_RE, '');
+}
+
+function pad(str, len) {
+  const visible = str.replace(ANSI_RE, '');
+  const gap = Math.max(0, len - visible.length);
+  return str + ' '.repeat(gap);
+}
+
+function padLeft(str, len) {
+  return ' '.repeat(Math.max(0, len - str.length)) + str;
+}
+
 function shortenPath(p, max = 46) {
+  // Home-relative shortening uses the DASHBOARD's $HOME as a heuristic —
+  // remote machines' paths usually share the same layout; worst case the
+  // path renders absolute.
   const home = process.env.HOME || '';
   if (home && p.startsWith(home)) p = '~' + p.slice(home.length);
   if (p.length <= max) return p;
   return COLOR.dim + '…' + COLOR.reset + p.slice(-(max - 1));
 }
 
+function shortenCommand(command, maxLen) {
+  const parts = command.trim().split(/\s+/);
+  if (parts.length && parts[0]) parts[0] = parts[0].split('/').pop();
+  const joined = parts.join(' ');
+  if (joined.length <= maxLen) return joined;
+  return joined.slice(0, maxLen - 1) + '…';
+}
+
+// Timestamps come from the reporter's clock, "now" from the dashboard's —
+// close enough on NTP-synced machines.
 function elapsed(startedAt) {
   const s = Math.floor((Date.now() - startedAt) / 1000);
   if (s < 60) return `${s}s`;
@@ -46,27 +102,37 @@ function elapsed(startedAt) {
   return `${h}h${m % 60}m`;
 }
 
-function pad(str, len) {
-  const visible = str.replace(/\x1b\[[0-9;]*m/g, '');
-  const gap = Math.max(0, len - visible.length);
-  return str + ' '.repeat(gap);
+function humanizeAgo(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
 }
 
-let prevCpuSnapshot = os.cpus();
+function formatCompactNumber(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
 
-function cpuUsagePerCore() {
-  const curr = os.cpus();
-  const prev = prevCpuSnapshot;
-  prevCpuSnapshot = curr;
+function formatBytesShort(bytes) {
+  const gb = bytes / (1024 ** 3);
+  if (gb >= 1) {
+    return `${gb % 1 === 0 ? gb.toFixed(0) : gb.toFixed(1)}G`;
+  }
+  const mb = bytes / (1024 ** 2);
+  return `${mb.toFixed(0)}M`;
+}
 
-  return curr.map((core, i) => {
-    const prevTimes = prev[i] ? prev[i].times : core.times;
-    const currTimes = core.times;
-    const idleDelta = currTimes.idle - prevTimes.idle;
-    const totalDelta = Object.keys(currTimes).reduce((sum, k) => sum + (currTimes[k] - prevTimes[k]), 0);
-    const usagePct = totalDelta > 0 ? 100 * (1 - idleDelta / totalDelta) : 0;
-    return Math.max(0, Math.min(100, usagePct));
-  });
+function formatRate(bytesPerSec) {
+  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
+  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
 }
 
 function usageColor(pct) {
@@ -81,10 +147,16 @@ function usageBar(pct, width) {
   return usageColor(pct) + bar + COLOR.reset;
 }
 
-function renderCpuSection(cols) {
-  const cores = cpuUsagePerCore();
+// ---------------------------------------------------------------------------
+// Stats sections (all take plain data from the machine snapshot)
+
+function renderCpuSection(cols, cores) {
   const lines = [];
   lines.push(COLOR.bold + 'CPU' + COLOR.reset);
+  if (!cores || !cores.length) {
+    lines.push(COLOR.dim + 'cpu usage unavailable' + COLOR.reset);
+    return lines;
+  }
 
   const barWidth = 8;
   const cellText = (i, pct) => {
@@ -105,41 +177,6 @@ function renderCpuSection(cols) {
   return lines;
 }
 
-function unitToBytes(value, unit) {
-  const n = parseFloat(value);
-  if (Number.isNaN(n)) return NaN;
-  const mult = { G: 1024 ** 3, M: 1024 ** 2, K: 1024 }[unit.toUpperCase()];
-  return n * (mult || 1);
-}
-
-function formatBytesShort(bytes) {
-  const gb = bytes / (1024 ** 3);
-  if (gb >= 1) {
-    return `${gb % 1 === 0 ? gb.toFixed(0) : gb.toFixed(1)}G`;
-  }
-  const mb = bytes / (1024 ** 2);
-  return `${mb.toFixed(0)}M`;
-}
-
-function fetchMemoryUsage() {
-  return new Promise((resolve) => {
-    execFile('top', ['-l', '1', '-n', '0'], (err, stdout) => {
-      if (err) return resolve(null);
-      const line = stdout.split('\n').find((l) => l.includes('PhysMem:'));
-      if (!line) return resolve(null);
-      const m = line.match(/PhysMem:\s*([\d.]+)([GMK])\s*used.*?,\s*([\d.]+)([GMK])\s*unused/i);
-      if (!m) return resolve(null);
-      const used = unitToBytes(m[1], m[2]);
-      const unused = unitToBytes(m[3], m[4]);
-      if (Number.isNaN(used) || Number.isNaN(unused)) return resolve(null);
-      const total = used + unused;
-      if (total <= 0) return resolve(null);
-      const pct = Math.round((used / total) * 100);
-      resolve({ used, total, pct });
-    });
-  });
-}
-
 function renderMemorySection(mem) {
   const lines = [];
   lines.push(COLOR.bold + 'Memory' + COLOR.reset);
@@ -152,23 +189,6 @@ function renderMemorySection(mem) {
   const label = `${formatBytesShort(mem.used)}/${formatBytesShort(mem.total)}`;
   lines.push(`${bar} ${pad(mem.pct + '%', 4)} ${COLOR.dim}${label} used${COLOR.reset}`);
   return lines;
-}
-
-function fetchDiskUsage() {
-  return new Promise((resolve) => {
-    execFile('df', ['-h', '/'], (err, stdout) => {
-      if (err) return resolve(null);
-      const dataLine = stdout.trim().split('\n')[1];
-      if (!dataLine) return resolve(null);
-      const parts = dataLine.trim().split(/\s+/);
-      // Filesystem Size Used Avail Capacity ...
-      if (parts.length < 5) return resolve(null);
-      const [, size, used, avail, capacity] = parts;
-      const pct = parseInt(capacity, 10);
-      if (Number.isNaN(pct)) return resolve(null);
-      resolve({ size, used, avail, pct });
-    });
-  });
 }
 
 function renderDiskSection(disk) {
@@ -185,38 +205,6 @@ function renderDiskSection(disk) {
   return lines;
 }
 
-let diskIoFetchInFlight = false;
-let lastDiskIo = null;
-
-function fetchDiskIoRate() {
-  if (diskIoFetchInFlight) return Promise.resolve(lastDiskIo);
-  diskIoFetchInFlight = true;
-  return new Promise((resolve) => {
-    execFile('iostat', ['-d', '-c', '2', '-w', '1'], (err, stdout) => {
-      diskIoFetchInFlight = false;
-      if (err) {
-        lastDiskIo = null;
-        return resolve(null);
-      }
-      const lines = stdout.trim().split('\n');
-      const lastLine = lines[lines.length - 1];
-      const nums = lastLine.trim().split(/\s+/).map(Number);
-      if (!nums.length || nums.some(Number.isNaN) || nums.length % 3 !== 0) {
-        lastDiskIo = null;
-        return resolve(null);
-      }
-      let mbps = 0;
-      let tps = 0;
-      for (let i = 0; i < nums.length; i += 3) {
-        tps += nums[i + 1];
-        mbps += nums[i + 2];
-      }
-      lastDiskIo = { mbps, tps };
-      resolve(lastDiskIo);
-    });
-  });
-}
-
 function renderDiskIoSection(diskIo) {
   const lines = [];
   lines.push(COLOR.bold + 'Disk I/O' + COLOR.reset);
@@ -229,54 +217,6 @@ function renderDiskIoSection(diskIo) {
     `${pad(Math.round(diskIo.tps) + ' tps', 10)}`
   );
   return lines;
-}
-
-let prevNet = null;
-
-function fetchNetworkTotals() {
-  return new Promise((resolve) => {
-    execFile('netstat', ['-ib'], (err, stdout) => {
-      if (err) return resolve(null);
-      const seen = new Map();
-      for (const line of stdout.trim().split('\n').slice(1)) {
-        const tokens = line.trim().split(/\s+/);
-        if (tokens.length < 7) continue;
-        const name = tokens[0].replace(/\*$/, '');
-        if (name === 'lo0' || seen.has(name)) continue;
-        const rx = Number(tokens[tokens.length - 5]);
-        const tx = Number(tokens[tokens.length - 2]);
-        if (Number.isNaN(rx) || Number.isNaN(tx)) continue;
-        seen.set(name, { rx, tx });
-      }
-      let rx = 0;
-      let tx = 0;
-      for (const v of seen.values()) {
-        rx += v.rx;
-        tx += v.tx;
-      }
-      resolve({ rx, tx });
-    });
-  });
-}
-
-function networkRates(curr) {
-  const now = Date.now();
-  if (!curr) return null;
-  if (!prevNet) {
-    prevNet = { ...curr, time: now };
-    return { rxRate: 0, txRate: 0 };
-  }
-  const dt = (now - prevNet.time) / 1000;
-  const rxRate = dt > 0 ? Math.max(0, (curr.rx - prevNet.rx) / dt) : 0;
-  const txRate = dt > 0 ? Math.max(0, (curr.tx - prevNet.tx) / dt) : 0;
-  prevNet = { ...curr, time: now };
-  return { rxRate, txRate };
-}
-
-function formatRate(bytesPerSec) {
-  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
-  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
 }
 
 function renderNetworkSection(net) {
@@ -293,165 +233,29 @@ function renderNetworkSection(net) {
   return lines;
 }
 
+// ---------------------------------------------------------------------------
+// Token spend graph
+
 const TOKEN_RANGES = ['hour', 'day', 'week', 'month'];
 const TOKEN_RANGE_CONFIG = {
-  hour: { buckets: 60, bucketMs: 60 * 1000, label: 'hour' },
-  day: { buckets: 24, bucketMs: 60 * 60 * 1000, label: 'day' },
-  week: { buckets: 7, bucketMs: 24 * 60 * 60 * 1000, label: 'week' },
-  month: { buckets: 30, bucketMs: 24 * 60 * 60 * 1000, label: 'month' },
+  hour: { bucketMs: 60 * 1000 },
+  day: { bucketMs: 60 * 60 * 1000 },
+  week: { bucketMs: 24 * 60 * 60 * 1000 },
+  month: { bucketMs: 24 * 60 * 60 * 1000 },
 };
 const SPARK_CHARS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-let currentRange = 'hour';
-// Cache covers the widest window (month, bucketed by day) plus we also keep
-// a fine-grained (per-minute, last hour) and per-hour (last day) cache so
-// each view can be re-bucketed cheaply without re-scanning files.
-let tokenCache = {
-  scannedAt: 0,
-  minuteBuckets: [], // last 60 minutes, index 0 = oldest
-  hourBuckets: [],   // last 24 hours
-  dayBuckets: [],    // last 30 days
-};
-
-function listTranscriptFiles() {
-  const files = [];
-  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
-  let projectDirs;
-  try {
-    projectDirs = fs.readdirSync(projectsDir);
-  } catch (e) {
-    return files;
-  }
-  for (const projectSlug of projectDirs) {
-    const projectPath = path.join(projectsDir, projectSlug);
-    let stat;
-    try {
-      stat = fs.statSync(projectPath);
-    } catch (e) {
-      continue;
-    }
-    if (!stat.isDirectory()) continue;
-    let entries;
-    try {
-      entries = fs.readdirSync(projectPath);
-    } catch (e) {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.endsWith('.jsonl')) continue;
-      const filePath = path.join(projectPath, entry);
-      try {
-        if (!fs.statSync(filePath).isFile()) continue;
-      } catch (e) {
-        continue;
-      }
-      files.push(filePath);
-    }
-  }
-  return files;
-}
-
-function tokensForUsage(usage) {
-  const fields = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
-  let sum = 0;
-  for (const f of fields) {
-    if (typeof usage[f] === 'number') sum += usage[f];
-  }
-  return sum;
-}
-
-// Scans all transcripts and buckets token usage into fixed-size rolling
-// windows: per-minute (60), per-hour (24), per-day (30). Runs on its own
-// slow cadence (TOKEN_SCAN_MS) since transcripts can be large/numerous.
-function scanTokenHistory() {
-  const now = Date.now();
-  const minuteMs = 60 * 1000;
-  const hourMs = 60 * 60 * 1000;
-  const dayMs = 24 * 60 * 60 * 1000;
-
-  const minuteBuckets = new Array(60).fill(0);
-  const hourBuckets = new Array(24).fill(0);
-  const dayBuckets = new Array(30).fill(0);
-
-  const minuteStart = now - 60 * minuteMs;
-  const hourStart = now - 24 * hourMs;
-  const dayStart = now - 30 * dayMs;
-
-  const files = listTranscriptFiles();
-  for (const filePath of files) {
-    let content;
-    try {
-      content = fs.readFileSync(filePath, 'utf8');
-    } catch (e) {
-      continue;
-    }
-    const lines = content.split('\n');
-    for (const line of lines) {
-      if (!line || !line.includes('"usage"')) continue;
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch (e) {
-        continue;
-      }
-      const usage = obj && obj.message && obj.message.usage;
-      if (!usage || typeof usage !== 'object') continue;
-      if (!obj.timestamp) continue;
-      const ts = new Date(obj.timestamp).getTime();
-      if (Number.isNaN(ts)) continue;
-      const tokens = tokensForUsage(usage);
-      if (tokens <= 0) continue;
-
-      if (ts >= minuteStart && ts <= now) {
-        const idx = Math.min(59, Math.floor((ts - minuteStart) / minuteMs));
-        minuteBuckets[idx] += tokens;
-      }
-      if (ts >= hourStart && ts <= now) {
-        const idx = Math.min(23, Math.floor((ts - hourStart) / hourMs));
-        hourBuckets[idx] += tokens;
-      }
-      if (ts >= dayStart && ts <= now) {
-        const idx = Math.min(29, Math.floor((ts - dayStart) / dayMs));
-        dayBuckets[idx] += tokens;
-      }
-    }
-  }
-
-  tokenCache = { scannedAt: now, minuteBuckets, hourBuckets, dayBuckets };
-}
-
-function getTokenBuckets(range) {
-  if (range === 'hour') return tokenCache.minuteBuckets;
-  if (range === 'day') return tokenCache.hourBuckets;
-  if (range === 'week') return tokenCache.dayBuckets.slice(-7);
-  return tokenCache.dayBuckets; // month
-}
-
-function humanizeAgo(ms) {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h`;
-  const d = Math.floor(h / 24);
-  return `${d}d`;
-}
-
 const SPARK_ROWS = 3;
 const SPARK_WIDTH_MULTIPLIER = 2;
-
-function formatCompactNumber(n) {
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return String(Math.round(n));
-}
-
 const Y_AXIS_WIDTH = 7; // label chars + 1 tick-glyph column
 
-function padLeft(str, len) {
-  return ' '.repeat(Math.max(0, len - str.length)) + str;
+let currentRange = 'hour';
+
+function getTokenBuckets(range, tokenBuckets) {
+  if (!tokenBuckets) return [];
+  if (range === 'hour') return tokenBuckets.minuteBuckets || [];
+  if (range === 'day') return tokenBuckets.hourBuckets || [];
+  if (range === 'week') return (tokenBuckets.dayBuckets || []).slice(-7);
+  return tokenBuckets.dayBuckets || []; // month
 }
 
 // A row of time-ago labels under the bars: window-start, three evenly
@@ -464,7 +268,7 @@ function buildTimeAxis(n, bucketMs, widthMultiplier) {
   positions.forEach((idx, i) => {
     const isLast = i === positions.length - 1;
     const label = isLast ? 'now' : '-' + humanizeAgo((n - idx) * bucketMs);
-    let col = isLast ? totalWidth - label.length : idx * widthMultiplier;
+    const col = isLast ? totalWidth - label.length : idx * widthMultiplier;
     for (let j = 0; j < label.length; j++) {
       const c = col + j;
       if (c >= 0 && c < totalWidth) chars[c] = label[j];
@@ -473,12 +277,15 @@ function buildTimeAxis(n, bucketMs, widthMultiplier) {
   return chars.join('');
 }
 
-function renderTokenSection(cols) {
+function renderTokenSection(tokenBuckets) {
   const lines = [];
   const cfg = TOKEN_RANGE_CONFIG[currentRange];
-  const buckets = getTokenBuckets(currentRange);
-  lines.push(COLOR.bold + COLOR.magenta + 'Token Spend' + COLOR.reset + `  [${currentRange}]  ` +
-    COLOR.dim + '(press h/d/w/m to switch, tab to cycle)' + COLOR.reset);
+  const buckets = getTokenBuckets(currentRange, tokenBuckets);
+  lines.push(COLOR.bold + COLOR.magenta + 'Token Spend' + COLOR.reset + `  [${currentRange}]`);
+  if (!buckets.length) {
+    lines.push(COLOR.dim + 'no token data' + COLOR.reset);
+    return lines;
+  }
 
   // Stack SPARK_ROWS one-line sparklines to get real vertical resolution:
   // each bucket's value maps to a 0..(SPARK_ROWS * 8) level, the bottom row
@@ -513,203 +320,72 @@ function renderTokenSection(cols) {
 
   const total = buckets.reduce((a, b) => a + b, 0);
   const windowMs = buckets.length * cfg.bucketMs;
-  const startLabel = humanizeAgo(windowMs) + ' ago';
-  lines.push(`${COLOR.dim}total:${COLOR.reset} ${total.toLocaleString()} tokens   ${startLabel} → now`);
+  lines.push(`${COLOR.dim}total:${COLOR.reset} ${total.toLocaleString()} tokens   ${humanizeAgo(windowMs)} ago → now`);
 
   return lines;
 }
 
-function findSessionTranscript(sessionId) {
-  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
-  let projectDirs;
-  try {
-    projectDirs = fs.readdirSync(projectsDir);
-  } catch (e) {
-    return null;
-  }
-  for (const slug of projectDirs) {
-    const candidate = path.join(projectsDir, slug, `${sessionId}.jsonl`);
-    try {
-      if (fs.statSync(candidate).isFile()) return candidate;
-    } catch (e) {
-      // not this project
-    }
-  }
-  return null;
+// ---------------------------------------------------------------------------
+// Alerts
+
+const WAITING_ALERT_DISPLAY_MS = 5000;
+let waitingAlertBanner = null; // { message, expiresAt }
+
+function notifyAlert(message) {
+  process.stdout.write('\x07');
+  execFile('osascript', ['-e', `display notification ${JSON.stringify(message)} with title "Claude Agents Dashboard"`], () => {});
+  waitingAlertBanner = { message, expiresAt: Date.now() + WAITING_ALERT_DISPLAY_MS };
 }
 
-// `claude agents --json` has no model field, but every assistant message
-// in the session's own transcript carries the model it was generated
-// with — scan backward for the most recent one to get the session's
-// current model.
-function currentModelForSession(sessionId) {
-  const filePath = findSessionTranscript(sessionId);
-  if (!filePath) return null;
-  let content;
-  try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch (e) {
-    return null;
-  }
-  const lines = content.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (!line || !line.includes('"model"')) continue;
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch (e) {
+// Tracks each session's last-known status across polls so we alert on the
+// moment a session transitions INTO "waiting" — not on every poll while it
+// stays waiting. Keys are namespaced by machine: pids (and in theory even
+// sessionIds) can collide across machines. On the very first poll, statuses
+// are only seeded, so sessions already waiting at dashboard startup don't
+// fire a false alert.
+const lastStatusBySession = new Map();
+const prevStaleByMachine = new Map();
+let statusTrackingSeeded = false;
+
+function detectTransitions(machines) {
+  for (const m of machines) {
+    const prevStale = prevStaleByMachine.get(m.machine);
+    if (m.stale) {
+      if (prevStale === false) {
+        notifyAlert(`${m.machine} went offline (reporter stopped reporting)`);
+      }
+      prevStaleByMachine.set(m.machine, true);
+      // Freeze this machine's session tracking while stale: its data is a
+      // frozen snapshot, and comparing against it every poll would misread
+      // the eventual reconnect as a burst of fresh transitions.
       continue;
     }
-    if (obj.type === 'assistant' && obj.message && obj.message.model) {
-      return obj.message.model;
+    prevStaleByMachine.set(m.machine, false);
+
+    const seenIds = new Set();
+    for (const a of m.agents || []) {
+      const id = `${m.machine}:${a.sessionId || a.pid}`;
+      seenIds.add(id);
+      const prevStatus = lastStatusBySession.get(id);
+      if (statusTrackingSeeded && prevStatus !== 'waiting' && a.status === 'waiting') {
+        notifyAlert(`${m.machine}/${a.name || id} needs input: ${a.waitingFor || 'unknown'}`);
+      }
+      lastStatusBySession.set(id, a.status);
+    }
+    // Clean up entries for this machine's sessions that ended.
+    for (const id of lastStatusBySession.keys()) {
+      if (id.startsWith(`${m.machine}:`) && !seenIds.has(id)) lastStatusBySession.delete(id);
     }
   }
-  return null;
+  statusTrackingSeeded = true;
 }
 
-function shortenModelName(model) {
-  if (!model) return '-';
-  return model.replace(/^claude-/, '').replace(/-\d{6,}$/, '');
-}
+// ---------------------------------------------------------------------------
+// Machine section rendering
 
-// A session's own transcript logs every sub-agent it dispatches (a
-// tool_use block named "Agent") immediately, but `claude agents --json`
-// has no visibility into them at all — they run inside the parent
-// process, not as separate OS-level sessions. Completion is logged
-// later as a queue-operation carrying a <task-notification> with a
-// matching <tool-use-id>. A dispatched id with no such notification
-// yet is still running.
-function activeSubAgentsForSession(sessionId) {
-  const filePath = findSessionTranscript(sessionId);
-  if (!filePath) return [];
-  let content;
-  try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch (e) {
-    return [];
-  }
-
-  const dispatched = new Map();
-  const resolved = new Set();
-  const errored = new Set();
-
-  for (const line of content.split('\n')) {
-    if (!line) continue;
-
-    if (line.includes('"tool_use"') && line.includes('"name":"Agent"')) {
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch (e) {
-        continue;
-      }
-      const blocks = obj && obj.message && obj.message.content;
-      if (Array.isArray(blocks)) {
-        for (const block of blocks) {
-          if (block && block.type === 'tool_use' && block.name === 'Agent' && block.id) {
-            const desc = (block.input && (block.input.description || block.input.prompt)) || 'agent task';
-            const ts = new Date(obj.timestamp).getTime();
-            dispatched.set(block.id, { description: String(desc).slice(0, 40), startedAt: Number.isNaN(ts) ? Date.now() : ts });
-          }
-        }
-      }
-      continue;
-    }
-
-    // A dispatch that failed immediately (e.g. an isolation setup error)
-    // never actually starts a background task, so it will never receive
-    // a task-notification — it must be excluded explicitly via is_error,
-    // not just left to look perpetually "running".
-    if (line.includes('"is_error":true') && line.includes('"tool_use_id"')) {
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch (e) {
-        continue;
-      }
-      const blocks = obj && obj.message && obj.message.content;
-      if (Array.isArray(blocks)) {
-        for (const block of blocks) {
-          if (block && block.is_error === true && block.tool_use_id) errored.add(block.tool_use_id);
-        }
-      }
-      continue;
-    }
-
-    if (line.includes('task-notification')) {
-      const m = line.match(/<tool-use-id>([^<]+)<\/tool-use-id>/);
-      if (m) resolved.add(m[1]);
-    }
-  }
-
-  const active = [];
-  for (const [id, info] of dispatched) {
-    if (resolved.has(id) || errored.has(id)) continue;
-    active.push(info);
-  }
-  return active.sort((a, b) => a.startedAt - b.startedAt);
-}
-
-// A session's Bash tool calls (and anything a sub-agent dispatched within
-// it runs) become real OS child processes of that session's own pid —
-// confirmed by tracing a live `turbo` build back to its owning session.
-// Build a ppid -> children adjacency list once per tick so each session
-// row can cheaply walk its own descendants.
-function fetchProcessTree() {
-  return new Promise((resolve) => {
-    execFile('ps', ['-eo', 'pid,ppid,command'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return resolve(new Map());
-      const childrenByPpid = new Map();
-      for (const line of stdout.split('\n').slice(1)) {
-        const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-        if (!m) continue;
-        const pid = Number(m[1]);
-        const ppid = Number(m[2]);
-        const command = m[3];
-        if (!childrenByPpid.has(ppid)) childrenByPpid.set(ppid, []);
-        childrenByPpid.get(ppid).push({ pid, command });
-      }
-      resolve(childrenByPpid);
-    });
-  });
-}
-
-// Builds the actual process tree rooted at `pid` (not a flattened list) so
-// e.g. a `turbo run test` node correctly shows its jest-worker processes
-// as ITS children rather than as unrelated siblings of the session.
-// Sibling processes with identical command lines are split into two
-// buckets: those with no children of their own collapse into one node
-// with a count (e.g. a dozen indistinguishable jest workers), while any
-// sibling that DOES have children is always shown on its own line with
-// its subtree attached — so collapsing duplicates never hides a real
-// descendant (e.g. one jest worker that happens to shell out to `git`).
-function buildProcessTree(pid, childrenByPpid, visited, depth = 0, maxDepth = 8) {
-  if (depth >= maxDepth) return [];
-  const kids = (childrenByPpid.get(pid) || []).filter((k) => !visited.has(k.pid));
-  const groups = new Map();
-  for (const kid of kids) {
-    visited.add(kid.pid);
-    if (!groups.has(kid.command)) groups.set(kid.command, []);
-    groups.get(kid.command).push(kid);
-  }
-
-  const nodes = [];
-  for (const members of groups.values()) {
-    const leaves = [];
-    for (const m of members) {
-      const subtree = buildProcessTree(m.pid, childrenByPpid, visited, depth + 1, maxDepth);
-      if (subtree.length > 0) {
-        nodes.push({ command: m.command, pid: m.pid, count: 1, children: subtree });
-      } else {
-        leaves.push(m);
-      }
-    }
-    if (leaves.length > 0) {
-      nodes.push({ command: leaves[0].command, pid: leaves[0].pid, count: leaves.length, children: [] });
-    }
-  }
-  return nodes;
+function connectHint(machine, agent) {
+  const target = machine.sshHint || machine.machine;
+  return `ssh ${target} 'claude attach ${agent.sessionId}'`;
 }
 
 function renderProcessTree(nodes, depth, lines, width) {
@@ -725,152 +401,162 @@ function renderProcessTree(nodes, depth, lines, width) {
   }
 }
 
-function shortenCommand(command, maxLen) {
-  const parts = command.trim().split(/\s+/);
-  if (parts.length && parts[0]) parts[0] = path.basename(parts[0]);
-  const joined = parts.join(' ');
-  if (joined.length <= maxLen) return joined;
-  return joined.slice(0, maxLen - 1) + '…';
-}
-
-function fetchAgents() {
-  return new Promise((resolve) => {
-    execFile('claude', ['agents', '--json', '--all'], { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return resolve({ error: err.message });
-      try {
-        resolve({ agents: JSON.parse(stdout) });
-      } catch (e) {
-        resolve({ error: 'failed to parse claude agents output: ' + e.message });
-      }
-    });
-  });
-}
-
-// Tracks each session's last-known status (keyed by sessionId, falling back
-// to pid) across ticks so we can detect the moment a session transitions
-// INTO "waiting" — as opposed to already being/staying "waiting", which
-// would otherwise re-fire an alert on every single tick.
-const lastStatusBySession = new Map();
-let statusTrackingSeeded = false;
-const WAITING_ALERT_DISPLAY_MS = 5000;
-let waitingAlertBanner = null; // { message, expiresAt }
-
-function notifyWaiting(message) {
-  process.stdout.write('\x07');
-  execFile('osascript', ['-e', `display notification ${JSON.stringify(message)} with title "Claude Agents Dashboard"`], () => {});
-  waitingAlertBanner = { message, expiresAt: Date.now() + WAITING_ALERT_DISPLAY_MS };
-}
-
-// Compares this tick's agent statuses against the previous tick's to find
-// sessions that just transitioned into "waiting", firing alerts for those.
-// On the very first tick, statuses are only seeded (not compared), so
-// sessions already sitting in "waiting" at startup don't trigger a false
-// alert.
-function detectWaitingTransitions(agents) {
-  const seenIds = new Set();
-  for (const a of agents) {
-    const id = a.sessionId || a.pid;
-    seenIds.add(id);
-    const prevStatus = lastStatusBySession.get(id);
-    if (statusTrackingSeeded && prevStatus !== 'waiting' && a.status === 'waiting') {
-      const message = `${a.name || id} needs input: ${a.waitingFor || 'unknown'}`;
-      notifyWaiting(message);
-    }
-    lastStatusBySession.set(id, a.status);
-  }
-  // Clean up entries for sessions that no longer appear (session ended).
-  for (const id of lastStatusBySession.keys()) {
-    if (!seenIds.has(id)) lastStatusBySession.delete(id);
-  }
-  statusTrackingSeeded = true;
-}
-
-// Agent sessions, their sub-agents, and their spawned process trees —
-// the "what's actually running" column.
-function buildAgentsColumn(agents, error, processTree, width) {
+function buildAgentsColumn(machine, treeMap, width) {
   const lines = [];
-  if (error) {
-    lines.push(COLOR.red + 'Error: ' + error + COLOR.reset);
-  } else if (!agents.length) {
-    lines.push(COLOR.dim + 'No background agent sessions found.' + COLOR.reset);
-  } else {
-    const sorted = [...agents].sort((a, b) => {
-      const oa = STATUS_ORDER[a.status] ?? 9;
-      const ob = STATUS_ORDER[b.status] ?? 9;
-      if (oa !== ob) return oa - ob;
-      return b.startedAt - a.startedAt;
-    });
+  if (machine.agentsError) {
+    lines.push(COLOR.red + 'Error: ' + machine.agentsError + COLOR.reset);
+    return lines;
+  }
+  const agents = machine.agents || [];
+  if (!agents.length) {
+    lines.push(COLOR.dim + 'No background agent sessions.' + COLOR.reset);
+    return lines;
+  }
 
-    const fixedWidths = 20 + 1 + 12 + 1 + 10 + 1 + 22 + 1 + 9 + 1 + 8 + 1; // NAME STATUS MODEL DETAIL ELAPSED PID + gaps
-    const projectWidth = Math.max(10, width - fixedWidths);
+  const sorted = [...agents].sort((a, b) => {
+    const oa = STATUS_ORDER[a.status] ?? 9;
+    const ob = STATUS_ORDER[b.status] ?? 9;
+    if (oa !== ob) return oa - ob;
+    return b.startedAt - a.startedAt;
+  });
 
-    const header = [
-      pad('NAME', 20),
-      pad('STATUS', 12),
-      pad('MODEL', 10),
-      pad('DETAIL', 22),
-      pad('ELAPSED', 9),
-      pad('PID', 8),
-      'PROJECT',
+  const fixedWidths = 20 + 1 + 12 + 1 + 10 + 1 + 22 + 1 + 9 + 1 + 8 + 1; // NAME STATUS MODEL DETAIL ELAPSED PID + gaps
+  const projectWidth = Math.max(10, width - fixedWidths);
+
+  const header = [
+    pad('NAME', 20),
+    pad('STATUS', 12),
+    pad('MODEL', 10),
+    pad('DETAIL', 22),
+    pad('ELAPSED', 9),
+    pad('PID', 8),
+    'PROJECT',
+  ].join(' ');
+  lines.push(COLOR.bold + header + COLOR.reset);
+
+  for (const a of sorted) {
+    const statusColor = STATUS_COLOR[a.status] || COLOR.reset;
+    const row = [
+      pad((a.name || '').slice(0, 20), 20),
+      pad(statusColor + a.status + COLOR.reset, 12),
+      pad(String(a.model || '-').slice(0, 10), 10),
+      pad((a.waitingFor || '-').slice(0, 22), 22),
+      pad(elapsed(a.startedAt), 9),
+      pad(String(a.pid), 8),
+      shortenPath(a.cwd, projectWidth),
     ].join(' ');
-    lines.push(COLOR.bold + header + COLOR.reset);
+    lines.push(row);
 
-    for (const a of sorted) {
-      const statusColor = STATUS_COLOR[a.status] || COLOR.reset;
-      const model = shortenModelName(currentModelForSession(a.sessionId));
-      const row = [
-        pad((a.name || '').slice(0, 20), 20),
-        pad(statusColor + a.status + COLOR.reset, 12),
-        pad(model.slice(0, 10), 10),
-        pad((a.waitingFor || '-').slice(0, 22), 22),
-        pad(elapsed(a.startedAt), 9),
-        pad(String(a.pid), 8),
-        shortenPath(a.cwd, projectWidth),
-      ].join(' ');
-      lines.push(row);
+    lines.push(`  ${COLOR.dim}⤷ ${connectHint(machine, a)}${COLOR.reset}`);
 
-      for (const sub of activeSubAgentsForSession(a.sessionId)) {
-        lines.push(
-          `  ${COLOR.dim}↳ ${COLOR.reset}${pad(sub.description, 40)} ` +
-          `${COLOR.yellow}running${COLOR.reset}  ${elapsed(sub.startedAt)}`
-        );
-      }
-
-      const procTree = buildProcessTree(a.pid, processTree, new Set([a.pid]));
-      renderProcessTree(procTree, 0, lines, width);
+    for (const sub of a.subAgents || []) {
+      lines.push(
+        `  ${COLOR.dim}↳ ${COLOR.reset}${pad(sub.description, 40)} ` +
+        `${COLOR.yellow}running${COLOR.reset}  ${elapsed(sub.startedAt)}`
+      );
     }
+
+    const procTree = buildProcessTree(a.pid, treeMap, new Set([a.pid]));
+    renderProcessTree(procTree, 0, lines, width);
   }
   return lines;
 }
 
-// CPU/memory/disk/network/token-spend — the "system vitals" column.
-function buildStatsColumn(disk, diskIo, net, mem, width) {
+function buildStatsColumn(vitals, width) {
+  const v = vitals || {};
   const lines = [];
-  lines.push(...renderCpuSection(width));
+  lines.push(...renderCpuSection(width, v.cpuCores));
   lines.push('');
-  lines.push(...renderMemorySection(mem));
+  lines.push(...renderMemorySection(v.memory));
   lines.push('');
-  lines.push(...renderDiskSection(disk));
+  lines.push(...renderDiskSection(v.disk));
   lines.push('');
-  lines.push(...renderDiskIoSection(diskIo));
+  lines.push(...renderDiskIoSection(v.diskIo));
   lines.push('');
-  lines.push(...renderNetworkSection(net));
+  lines.push(...renderNetworkSection(v.net));
   return lines;
 }
 
 // Below a minimum width, a side-by-side layout would squeeze both columns
-// into illegibility, so fall back to the original stacked single-column
-// layout instead of forcing a split that doesn't fit.
+// into illegibility, so fall back to a stacked single-column layout.
 const MIN_SPLIT_COLS = 90;
 const COLUMN_GUTTER = 3;
 
-function render(agents, error, disk, diskIo, net, mem, processTree) {
+// Hub-reported age is frozen between polls; keep it counting using the time
+// since we received the response (avoids trusting the hub's clock, which
+// may be skewed relative to ours).
+function liveAgeMs(machine) {
+  return machine.ageMs + (Date.now() - lastReceivedAt);
+}
+
+function renderMachineSection(m, cols) {
+  const lines = [];
+
+  const dot = m.stale ? COLOR.red + '○' : COLOR.green + '●';
+  const age = humanizeAgo(liveAgeMs(m)) + ' ago';
+  const sessions = (m.agents || []).length;
+  const staleNote = m.stale ? `  ${COLOR.red}stale — last seen ${age}${COLOR.reset}` : `  ${COLOR.dim}last seen ${age}${COLOR.reset}`;
+  lines.push(`${dot}${COLOR.reset} ${COLOR.bold}${m.machine}${COLOR.reset}${staleNote}  ${COLOR.dim}${sessions} session${sessions === 1 ? '' : 's'}${COLOR.reset}`);
+  lines.push('');
+
+  if (m.schemaVersion !== SCHEMA_VERSION) {
+    lines.push(COLOR.red + `reporter schema v${m.schemaVersion} ≠ dashboard v${SCHEMA_VERSION} — update ${m.machine}'s reporter` + COLOR.reset);
+    return lines;
+  }
+
+  const treeMap = inflateProcessTree(m.processTree);
+
+  const splitLayout = cols >= MIN_SPLIT_COLS;
+  const rightWidth = splitLayout ? Math.min(64, Math.max(50, Math.floor(cols * 0.38))) : Math.min(cols, 100);
+  const leftWidth = splitLayout ? (cols - rightWidth - COLUMN_GUTTER) : Math.min(cols, 100);
+
+  const leftLines = buildAgentsColumn(m, treeMap, leftWidth);
+  const rightLines = buildStatsColumn(m.vitals, rightWidth);
+
+  const body = [];
+  if (splitLayout) {
+    const rowCount = Math.max(leftLines.length, rightLines.length);
+    for (let i = 0; i < rowCount; i++) {
+      body.push(pad(leftLines[i] || '', leftWidth) + ' '.repeat(COLUMN_GUTTER) + (rightLines[i] || ''));
+    }
+  } else {
+    body.push(...leftLines);
+    body.push('');
+    body.push(...rightLines);
+  }
+
+  body.push('');
+  body.push(...renderTokenSection(m.tokenBuckets));
+
+  if (m.stale) {
+    // Last-known data, visually muted: strip the section's own colors so
+    // nothing cancels the dim wrapping.
+    for (const line of body) {
+      lines.push(COLOR.dim + stripAnsi(line) + COLOR.reset);
+    }
+  } else {
+    lines.push(...body);
+  }
+
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
+// Top-level render
+
+let lastHubResponse = null; // parsed GET /snapshot body
+let lastReceivedAt = 0;     // Date.now() when lastHubResponse arrived
+let lastPollError = null;   // { kind: 'auth'|'network'|'http', message }
+
+function render() {
   const cols = process.stdout.columns || 100;
   const lines = [];
-  const title = ` Claude Agents Dashboard `;
   const now = new Date().toLocaleTimeString();
-  lines.push(COLOR.bold + COLOR.cyan + title + COLOR.reset + COLOR.dim + `  refreshing every ${REFRESH_MS / 1000}s  •  ${now}` + COLOR.reset);
-  lines.push('─'.repeat(Math.min(cols, 100)));
+  lines.push(
+    COLOR.bold + COLOR.cyan + ' Claude Agents Dashboard ' + COLOR.reset +
+    COLOR.dim + ` ${HUB_URL}  •  refreshing every ${REFRESH_MS / 1000}s  •  ${now}` + COLOR.reset
+  );
+  lines.push('─'.repeat(Math.min(cols, 120)));
 
   if (waitingAlertBanner && Date.now() < waitingAlertBanner.expiresAt) {
     lines.push(COLOR.bold + COLOR.red + `⚠ ${waitingAlertBanner.message}` + COLOR.reset);
@@ -879,68 +565,73 @@ function render(agents, error, disk, diskIo, net, mem, processTree) {
     waitingAlertBanner = null;
   }
 
-  const splitLayout = cols >= MIN_SPLIT_COLS;
-  const rightWidth = splitLayout ? Math.min(64, Math.max(50, Math.floor(cols * 0.38))) : Math.min(cols, 100);
-  const leftWidth = splitLayout ? (cols - rightWidth - COLUMN_GUTTER) : Math.min(cols, 100);
-
-  const leftLines = buildAgentsColumn(agents, error, processTree, leftWidth);
-  const rightLines = buildStatsColumn(disk, diskIo, net, mem, rightWidth);
-
-  if (splitLayout) {
-    const rowCount = Math.max(leftLines.length, rightLines.length);
-    for (let i = 0; i < rowCount; i++) {
-      lines.push(pad(leftLines[i] || '', leftWidth) + ' '.repeat(COLUMN_GUTTER) + (rightLines[i] || ''));
-    }
-  } else {
-    lines.push(...leftLines);
+  if (lastPollError) {
+    const label = {
+      auth: `✗ hub rejected the token (401) — check --token`,
+      network: `✗ hub unreachable: ${lastPollError.message}`,
+      http: `✗ hub error: ${lastPollError.message}`,
+    }[lastPollError.kind];
+    lines.push(COLOR.bold + COLOR.red + label + COLOR.reset + (lastHubResponse ? COLOR.dim + '  (showing last known data)' + COLOR.reset : ''));
     lines.push('');
-    lines.push('─'.repeat(Math.min(cols, 100)));
-    lines.push(...rightLines);
+  }
+
+  if (!lastHubResponse) {
+    if (!lastPollError) lines.push(COLOR.dim + 'connecting to hub…' + COLOR.reset);
+  } else {
+    const machines = [...(lastHubResponse.machines || [])].sort((a, b) => {
+      if (a.stale !== b.stale) return a.stale ? 1 : -1;
+      return a.machine.localeCompare(b.machine);
+    });
+
+    if (!machines.length) {
+      lines.push(COLOR.dim + 'No machines have reported yet.' + COLOR.reset);
+    }
+
+    machines.forEach((m, i) => {
+      if (i > 0) {
+        lines.push('');
+        lines.push(COLOR.dim + '─'.repeat(Math.min(cols, 120)) + COLOR.reset);
+      }
+      lines.push(...renderMachineSection(m, cols));
+    });
   }
 
   lines.push('');
-  lines.push('─'.repeat(Math.min(cols, 100)));
-  lines.push(...renderTokenSection(cols));
-
-  lines.push('');
-  lines.push(COLOR.dim + 'h/d/w/m switch range • q or Ctrl+C to quit' + COLOR.reset);
+  lines.push(COLOR.dim + 'h/d/w/m or tab/←/→ switch token range • q or Ctrl+C to quit' + COLOR.reset);
 
   process.stdout.write('\x1b[H\x1b[J' + lines.join('\n') + '\n');
 }
 
-// Last-known stats from the most recent tick(), kept so keypress-driven
-// range changes can re-render immediately without re-running subprocesses.
-let lastAgents = [];
-let lastError = null;
-let lastDisk = null;
-let lastDiskIoStat = null;
-let lastNet = null;
-let lastMemory = null;
-let lastProcessTree = new Map();
+// ---------------------------------------------------------------------------
+// Hub polling
 
-function renderNow() {
-  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory, lastProcessTree);
+let pollInFlight = false;
+
+async function pollHub() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const { status, json } = await requestJson('GET', `${HUB_URL}/snapshot`, { token: TOKEN });
+    if (status === 401) {
+      lastPollError = { kind: 'auth', message: 'unauthorized' };
+    } else if (status !== 200 || !json) {
+      lastPollError = { kind: 'http', message: `HTTP ${status}` };
+    } else {
+      lastHubResponse = json;
+      lastReceivedAt = Date.now();
+      lastPollError = null;
+      detectTransitions(json.machines || []);
+    }
+  } catch (e) {
+    lastPollError = { kind: 'network', message: e.message };
+  } finally {
+    pollInFlight = false;
+  }
+  render();
 }
 
-async function tick() {
-  const [{ agents, error }, disk, diskIo, netTotals, mem, processTree] = await Promise.all([
-    fetchAgents(),
-    fetchDiskUsage(),
-    fetchDiskIoRate(),
-    fetchNetworkTotals(),
-    fetchMemoryUsage(),
-    fetchProcessTree(),
-  ]);
-  lastAgents = agents || [];
-  lastError = error;
-  lastDisk = disk;
-  lastDiskIoStat = diskIo;
-  lastNet = networkRates(netTotals);
-  lastMemory = mem;
-  lastProcessTree = processTree;
-  detectWaitingTransitions(lastAgents);
-  render(lastAgents, lastError, lastDisk, lastDiskIoStat, lastNet, lastMemory, lastProcessTree);
-}
+// ---------------------------------------------------------------------------
+// Lifecycle
 
 function cleanup() {
   process.stdout.write('\x1b[?1049l\x1b[?25h');
@@ -978,7 +669,7 @@ function setupKeyboard() {
       changed = true;
     }
 
-    if (changed) renderNow();
+    if (changed) render();
   });
 }
 
@@ -990,11 +681,8 @@ function main() {
 
   setupKeyboard();
 
-  scanTokenHistory();
-  setInterval(scanTokenHistory, TOKEN_SCAN_MS);
-
-  tick();
-  setInterval(tick, REFRESH_MS);
+  pollHub();
+  setInterval(pollHub, REFRESH_MS);
 }
 
 main();
