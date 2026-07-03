@@ -130,3 +130,17 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, BIND, () => {
   console.log(`claude-observer hub listening on http://${BIND}:${PORT} (stale after ${STALE_MS / 1000}s)`);
 });
+
+// In a container this process is PID 1, which gets no default signal
+// behavior from the kernel — without explicit handlers, SIGINT/SIGTERM are
+// ignored and Ctrl+C / `docker stop` can't shut it down. Reporters and
+// dashboards hold keep-alive connections, so they must be closed explicitly
+// or server.close() would never finish.
+function shutdown(signal) {
+  console.log(`received ${signal}, shutting down`);
+  server.close(() => process.exit(0));
+  server.closeAllConnections();
+  setTimeout(() => process.exit(0), 1000).unref();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
