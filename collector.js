@@ -18,6 +18,29 @@ const https = require('https');
 // rendering garbage.
 const SCHEMA_VERSION = 1;
 
+// Minimal .env loader (KEY=VALUE lines, # comments, optional quotes) so the
+// shared token doesn't have to be passed on the command line. Real
+// environment variables win over .env entries; CLI flags win over both.
+// hub.js carries its own copy of this to stay single-file deployable.
+function loadDotEnv(filePath) {
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    return;
+  }
+  for (const line of content.split('\n')) {
+    if (line.trim().startsWith('#')) continue;
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m) continue;
+    let value = m[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(m[1] in process.env)) process.env[m[1]] = value;
+  }
+}
+
 const TOKEN_SCAN_MS = 30 * 1000;
 const PROCESS_COMMAND_MAX_LEN = 200;
 
@@ -648,6 +671,7 @@ function requestJson(method, urlStr, { token, body, timeoutMs = 5000 } = {}) {
 module.exports = {
   SCHEMA_VERSION,
   TOKEN_SCAN_MS,
+  loadDotEnv,
   collectSnapshot,
   scanTokenHistory,
   buildProcessTree,

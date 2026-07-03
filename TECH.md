@@ -181,7 +181,12 @@ Every `vitals.*` sub-shape matches the existing render function signatures exact
 
 ## CLI args / env vars
 
-CLI flag wins over env var wins over default, consistent across all three processes:
+CLI flag wins over env var wins over `.env` wins over default, consistent across
+all three processes. Each process loads a `.env` file (KEY=VALUE lines, gitignored,
+see `.env.template`) from its own directory at startup, populating only variables
+not already set in the real environment — so the shared token never has to appear
+on a command line or in shell history. `hub.js` carries its own copy of the tiny
+loader to stay single-file deployable.
 
 | Process | Flag | Env var | Default |
 |---|---|---|---|

@@ -7,7 +7,10 @@
 // plain background shell.
 
 const os = require('os');
-const { collectSnapshot, scanTokenHistory, TOKEN_SCAN_MS, requestJson } = require('./collector');
+const path = require('path');
+const { collectSnapshot, scanTokenHistory, TOKEN_SCAN_MS, requestJson, loadDotEnv } = require('./collector');
+
+loadDotEnv(path.join(__dirname, '.env'));
 
 function parseArgs() {
   const args = process.argv.slice(2);

@@ -11,6 +11,32 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// Duplicated from collector.js so this file stays deployable on its own:
+// loads KEY=VALUE lines from .env next to this file; real environment
+// variables win over .env entries, CLI flags win over both.
+function loadDotEnv(filePath) {
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    return;
+  }
+  for (const line of content.split('\n')) {
+    if (line.trim().startsWith('#')) continue;
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m) continue;
+    let value = m[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(m[1] in process.env)) process.env[m[1]] = value;
+  }
+}
+
+loadDotEnv(path.join(__dirname, '.env'));
 
 function parseArgs() {
   const args = process.argv.slice(2);

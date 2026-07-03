@@ -6,8 +6,11 @@
 // locally; every machine (including this one) reports via reporter.js.
 
 const { execFile } = require('child_process');
+const path = require('path');
 const readline = require('readline');
-const { SCHEMA_VERSION, buildProcessTree, inflateProcessTree, requestJson } = require('./collector');
+const { SCHEMA_VERSION, buildProcessTree, inflateProcessTree, requestJson, loadDotEnv } = require('./collector');
+
+loadDotEnv(path.join(__dirname, '.env'));
 
 function parseArgs() {
   const args = process.argv.slice(2);

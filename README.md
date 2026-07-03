@@ -32,17 +32,21 @@ Three small Node processes, no npm packages:
 ## Quick start (single machine, all three locally)
 
 ```sh
-node hub.js --token mysecret &
-node reporter.js --hub http://127.0.0.1:7345 --token mysecret &
-node dashboard.js --hub http://127.0.0.1:7345 --token mysecret
+cp .env.template .env    # then set CLAUDE_OBSERVER_TOKEN in .env
+node hub.js &
+node reporter.js &
+node dashboard.js
 ```
 
-Add machines by running another `reporter.js` on each, pointed at the same
-hub (via its public HTTPS URL if proxied):
+All three processes read `.env` from their own directory (never committed —
+it's gitignored). Every setting can also be passed as a CLI flag or a real
+environment variable; precedence is flag > environment > `.env` > default.
+
+Add machines by running another `reporter.js` on each, with its own `.env`
+pointing at the hub's public HTTPS URL if proxied:
 
 ```sh
-node reporter.js --hub https://hub.example.com/observer --token mysecret \
-  --name mac-mini --ssh-hint marco@mini.local
+node reporter.js --name mac-mini --ssh-hint marco@mini.local
 ```
 
 Press `q` or `Ctrl+C` to quit the dashboard — it uses the terminal's alternate
@@ -91,7 +95,8 @@ when the dashboard starts.
 
 ## Configuration
 
-CLI flag wins over env var wins over default:
+CLI flag wins over env var wins over `.env` (loaded from the script's own
+directory, see `.env.template`) wins over default:
 
 | Process | Flag | Env var | Default |
 |---|---|---|---|
