@@ -1,0 +1,16 @@
+# claude-observer hub — self-contained store-and-serve server.
+# Runs with config from the environment or a mounted .env:
+#   docker run -p 7345:7345 --env-file .env ghcr.io/<owner>/claude-observer-hub
+#   docker run -p 7345:7345 -v ./.env:/app/.env ghcr.io/<owner>/claude-observer-hub
+FROM node:22-alpine
+
+WORKDIR /app
+COPY hub.js .
+
+# Inside a container 127.0.0.1 would be unreachable from outside it — the
+# published port is the exposure boundary here. Overridable with -e.
+ENV CLAUDE_OBSERVER_HUB_BIND=0.0.0.0
+
+EXPOSE 7345
+USER node
+CMD ["node", "hub.js"]

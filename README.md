@@ -112,6 +112,25 @@ directory, see `.env.template`) wins over default:
 | dashboard | `--hub <url>`, `--token <t>` | same as reporter | required |
 | dashboard | positional first arg | — | refresh seconds, default 2 |
 
+## Docker (hub and dashboard)
+
+GitHub workflows build multi-arch (amd64/arm64) images for the hub and the
+dashboard on every push to `main` touching their files, published to GitHub
+Container Registry as `<repo>-hub` and `<repo>-dashboard`. Both read their
+config from the environment, so run them with your `.env`:
+
+```sh
+# hub — inside the container it binds 0.0.0.0; the published port is the boundary
+docker run -d -p 7345:7345 --env-file .env ghcr.io/<owner>/claude-observer-hub
+
+# dashboard — needs an interactive TTY
+docker run -it --env-file .env ghcr.io/<owner>/claude-observer-dashboard
+```
+
+Alternatively mount the file itself: `-v ./.env:/app/.env`. The reporter is
+not dockerized — it must run directly on each macOS host to see its
+sessions and system stats.
+
 ## Notes
 
 - **Reporters are macOS-only** — they parse macOS-flavored `top`, `iostat`,
