@@ -208,32 +208,21 @@ function renderDiskSection(disk) {
   return lines;
 }
 
-function renderDiskIoSection(diskIo) {
-  const lines = [];
-  lines.push(COLOR.bold + 'Disk I/O' + COLOR.reset);
-  if (!diskIo) {
-    lines.push(COLOR.dim + 'disk throughput unavailable' + COLOR.reset);
-    return lines;
-  }
-  lines.push(
-    `${COLOR.cyan}⇅${COLOR.reset} ${pad(diskIo.mbps.toFixed(2) + ' MB/s', 12)} ` +
-    `${pad(Math.round(diskIo.tps) + ' tps', 10)}`
-  );
-  return lines;
-}
-
-function renderNetworkSection(net) {
-  const lines = [];
-  lines.push(COLOR.bold + 'Network' + COLOR.reset);
-  if (!net) {
-    lines.push(COLOR.dim + 'network usage unavailable' + COLOR.reset);
-    return lines;
-  }
-  lines.push(
-    `${COLOR.cyan}↓ RX${COLOR.reset} ${pad(formatRate(net.rxRate), 12)} ` +
-    `${COLOR.cyan}↑ TX${COLOR.reset} ${pad(formatRate(net.txRate), 12)}`
-  );
-  return lines;
+// Disk I/O and Network share one two-line block — both are single short
+// value lines, and stacking them as separate sections wasted four rows in
+// the stats column.
+function renderIoNetworkSection(diskIo, net) {
+  const half = 26;
+  const ioValue = diskIo
+    ? `${COLOR.cyan}⇅${COLOR.reset} ${diskIo.mbps.toFixed(2)} MB/s  ${Math.round(diskIo.tps)} tps`
+    : COLOR.dim + 'unavailable' + COLOR.reset;
+  const netValue = net
+    ? `${COLOR.cyan}↓${COLOR.reset} ${formatRate(net.rxRate)}  ${COLOR.cyan}↑${COLOR.reset} ${formatRate(net.txRate)}`
+    : COLOR.dim + 'unavailable' + COLOR.reset;
+  return [
+    pad(COLOR.bold + 'Disk I/O' + COLOR.reset, half) + COLOR.bold + 'Network' + COLOR.reset,
+    pad(ioValue, half) + netValue,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -261,13 +250,31 @@ function getTokenBuckets(range, tokenBuckets) {
   return tokenBuckets.dayBuckets || []; // month
 }
 
-// A row of time-ago labels under the bars: window-start, three evenly
-// spaced points in between, and "now" pinned to the right edge — so you
-// can tell where each bar actually falls in time without hovering.
+// Merges adjacent buckets (summing — values are spend totals) so the graph
+// fits a column narrower than one char per bucket, e.g. the 60-bucket hour
+// view inside the ~50-char stats column.
+function resampleBuckets(buckets, maxCols) {
+  if (buckets.length <= maxCols) return { buckets, groupSize: 1 };
+  const groupSize = Math.ceil(buckets.length / maxCols);
+  const out = [];
+  for (let i = 0; i < buckets.length; i += groupSize) {
+    let sum = 0;
+    for (let j = i; j < Math.min(i + groupSize, buckets.length); j++) sum += buckets[j];
+    out.push(sum);
+  }
+  return { buckets: out, groupSize };
+}
+
+// A row of time-ago labels under the bars: window-start, evenly spaced
+// points in between, and "now" pinned to the right edge — so you can tell
+// where each bar actually falls in time without hovering. Narrow graphs
+// get three labels instead of five to avoid overlap.
 function buildTimeAxis(n, bucketMs, widthMultiplier) {
   const totalWidth = n * widthMultiplier;
   const chars = new Array(totalWidth).fill(' ');
-  const positions = n >= 10 ? [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor((3 * n) / 4), n - 1] : [0, Math.floor(n / 2), n - 1];
+  const positions = (n >= 10 && totalWidth >= 60)
+    ? [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor((3 * n) / 4), n - 1]
+    : [0, Math.floor(n / 2), n - 1];
   positions.forEach((idx, i) => {
     const isLast = i === positions.length - 1;
     const label = isLast ? 'now' : '-' + humanizeAgo((n - idx) * bucketMs);
@@ -280,22 +287,28 @@ function buildTimeAxis(n, bucketMs, widthMultiplier) {
   return chars.join('');
 }
 
-function renderTokenSection(tokenBuckets) {
+function renderTokenSection(tokenBuckets, width) {
   const lines = [];
   const cfg = TOKEN_RANGE_CONFIG[currentRange];
-  const buckets = getTokenBuckets(currentRange, tokenBuckets);
+  const rawBuckets = getTokenBuckets(currentRange, tokenBuckets);
   lines.push(COLOR.bold + COLOR.magenta + 'Token Spend' + COLOR.reset + `  [${currentRange}]`);
-  if (!buckets.length) {
+  if (!rawBuckets.length) {
     lines.push(COLOR.dim + 'no token data' + COLOR.reset);
     return lines;
   }
+
+  // Fit the graph to the column: merge adjacent buckets when there are more
+  // than one per available char, then widen each bar (up to the usual 2×)
+  // with whatever room is left.
+  const budget = Math.max(20, width - Y_AXIS_WIDTH);
+  const { buckets, groupSize } = resampleBuckets(rawBuckets, budget);
+  const bucketMs = cfg.bucketMs * groupSize;
+  const widthMultiplier = Math.max(1, Math.min(SPARK_WIDTH_MULTIPLIER, Math.floor(budget / buckets.length)));
 
   // Stack SPARK_ROWS one-line sparklines to get real vertical resolution:
   // each bucket's value maps to a 0..(SPARK_ROWS * 8) level, the bottom row
   // draws the lowest 8 levels, the next row the next 8, and so on, using
   // the same eighth-block characters for the fractional top of the bar.
-  // Each bucket is also drawn twice as wide, since a single character per
-  // bucket reads as too thin once the graph has real height.
   const max = Math.max(1, ...buckets);
   const totalLevels = SPARK_ROWS * SPARK_CHARS.length;
   const levels = buckets.map((v) => Math.round((v / max) * totalLevels));
@@ -306,7 +319,7 @@ function renderTokenSection(tokenBuckets) {
     for (const level of levels) {
       const filled = Math.max(0, Math.min(SPARK_CHARS.length, level - rowFloor));
       const ch = filled === 0 ? ' ' : SPARK_CHARS[filled - 1];
-      rowStr += ch.repeat(SPARK_WIDTH_MULTIPLIER);
+      rowStr += ch.repeat(widthMultiplier);
     }
 
     const label = row === 0 ? formatCompactNumber(max) : '';
@@ -315,14 +328,14 @@ function renderTokenSection(tokenBuckets) {
     lines.push(COLOR.dim + gutter + COLOR.reset + COLOR.magenta + rowStr + COLOR.reset);
   }
 
-  const barWidth = buckets.length * SPARK_WIDTH_MULTIPLIER;
+  const barWidth = buckets.length * widthMultiplier;
   const baseline = padLeft('0', Y_AXIS_WIDTH - 1) + '└' + '─'.repeat(barWidth);
   lines.push(COLOR.dim + baseline + COLOR.reset);
 
-  lines.push(' '.repeat(Y_AXIS_WIDTH) + COLOR.dim + buildTimeAxis(buckets.length, cfg.bucketMs, SPARK_WIDTH_MULTIPLIER) + COLOR.reset);
+  lines.push(' '.repeat(Y_AXIS_WIDTH) + COLOR.dim + buildTimeAxis(buckets.length, bucketMs, widthMultiplier) + COLOR.reset);
 
-  const total = buckets.reduce((a, b) => a + b, 0);
-  const windowMs = buckets.length * cfg.bucketMs;
+  const total = rawBuckets.reduce((a, b) => a + b, 0);
+  const windowMs = rawBuckets.length * cfg.bucketMs;
   lines.push(`${COLOR.dim}total:${COLOR.reset} ${total.toLocaleString()} tokens   ${humanizeAgo(windowMs)} ago → now`);
 
   return lines;
@@ -465,7 +478,7 @@ function buildAgentsColumn(machine, treeMap, width) {
   return lines;
 }
 
-function buildStatsColumn(vitals, width) {
+function buildStatsColumn(vitals, tokenBuckets, width) {
   const v = vitals || {};
   const lines = [];
   lines.push(...renderCpuSection(width, v.cpuCores));
@@ -474,9 +487,9 @@ function buildStatsColumn(vitals, width) {
   lines.push('');
   lines.push(...renderDiskSection(v.disk));
   lines.push('');
-  lines.push(...renderDiskIoSection(v.diskIo));
+  lines.push(...renderIoNetworkSection(v.diskIo, v.net));
   lines.push('');
-  lines.push(...renderNetworkSection(v.net));
+  lines.push(...renderTokenSection(tokenBuckets, width));
   return lines;
 }
 
@@ -514,7 +527,7 @@ function renderMachineSection(m, cols) {
   const leftWidth = splitLayout ? (cols - rightWidth - COLUMN_GUTTER) : Math.min(cols, 100);
 
   const leftLines = buildAgentsColumn(m, treeMap, leftWidth);
-  const rightLines = buildStatsColumn(m.vitals, rightWidth);
+  const rightLines = buildStatsColumn(m.vitals, m.tokenBuckets, rightWidth);
 
   const body = [];
   if (splitLayout) {
@@ -527,9 +540,6 @@ function renderMachineSection(m, cols) {
     body.push('');
     body.push(...rightLines);
   }
-
-  body.push('');
-  body.push(...renderTokenSection(m.tokenBuckets));
 
   if (m.stale) {
     // Last-known data, visually muted: strip the section's own colors so
